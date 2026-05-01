@@ -54,10 +54,16 @@ import {
 } from '@documenso/lib/utils/envelope';
 import { prisma } from '@documenso/prisma';
 
+// P5 patch: admin REST handlers (org + user CRUD).
+// See parallelfive/documenso P5_PATCHES.md § Patch 1.
+import { adminImplementation } from './admin/implementation';
 import { ApiContractV1 } from './contract';
 import { authenticatedMiddleware } from './middleware/authenticated';
 
 export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
+  // P5 fork extension — admin REST surface. See ./admin/ + P5_PATCHES.md.
+  ...adminImplementation,
+
   getDocuments: authenticatedMiddleware(async (args, user, team) => {
     const page = Number(args.query.page) || 1;
     const perPage = Number(args.query.perPage) || 10;

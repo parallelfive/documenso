@@ -16,7 +16,7 @@ import { isRecipientEmailValidForSending } from '@documenso/lib/utils/recipients
 import { prisma } from '@documenso/prisma';
 
 import { getI18nInstance } from '../../../client-only/providers/i18n-server';
-import { NEXT_PUBLIC_WEBAPP_URL } from '../../../constants/app';
+import { NEXT_PUBLIC_WEBAPP_URL, SIGNING_LINK_BASE_URL } from '../../../constants/app';
 import {
   RECIPIENT_ROLES_DESCRIPTION,
   RECIPIENT_ROLE_TO_EMAIL_TYPE,
@@ -159,7 +159,7 @@ export const run = async ({
   };
 
   const assetBaseUrl = NEXT_PUBLIC_WEBAPP_URL() || 'http://localhost:3000';
-  const signDocumentLink = `${NEXT_PUBLIC_WEBAPP_URL()}/sign/${recipient.token}`;
+  const signDocumentLink = `${SIGNING_LINK_BASE_URL()}/sign/${recipient.token}`;
 
   const template = createElement(DocumentInviteEmailTemplate, {
     documentName: envelope.title,

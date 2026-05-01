@@ -40,6 +40,8 @@ import {
   ZUpdateFieldMutationSchema,
   ZUpdateRecipientMutationSchema,
 } from './schema';
+// P5 patch: admin REST surface for org + user CRUD. See P5_PATCHES.md § Patch 1.
+import { AdminContract } from './admin/contract';
 
 const c = initContract();
 
@@ -329,6 +331,11 @@ export const ApiContractV1 = c.router(
       deprecated: true,
       description: deprecatedDescription,
     },
+
+    // P5 fork extension — admin REST surface (org + user CRUD).
+    // Auth: requires API token whose owner has Role.ADMIN.
+    // See parallelfive/documenso P5_PATCHES.md § Patch 1.
+    ...AdminContract,
   },
   {
     baseHeaders: ZAuthorizationHeadersSchema,

@@ -43,27 +43,49 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
 
 ## Active Patches
 
-(none yet — the bare image is identical to upstream until we ship the integration patches below)
+### 1. Admin REST API for Organisations + Users — landed 2026-05-01
 
-## Planned Patches (in flight as of 2026-05-01)
+- **Image surface:** `/api/v1/admin/organisations` + `/api/v1/admin/users` (full CRUD + member add/remove)
+- **OpenAPI:** auto-published in `/api/v1/openapi.json` via the existing ts-rest → OpenAPI pipeline
+- **Auth:** new `adminAuthenticatedMiddleware` — wraps `authenticatedMiddleware`, additionally requires `Role.ADMIN` on the API token's owner
+- **Files (additive — patch is self-contained except for ~10 lines wiring it into the main contract + implementation):**
+  - `packages/api/v1/admin/contract.ts` — ts-rest contract for the admin endpoints
+  - `packages/api/v1/admin/schema.ts` — zod request/response schemas
+  - `packages/api/v1/admin/implementation.ts` — handlers; wraps `createOrganisation`, `createUser`, `getUserByEmail` lib helpers + direct prisma for org/user reads + member add/remove
+  - `packages/api/v1/middleware/admin-authenticated.ts` — admin guard middleware (re-fetches `roles` since upstream `getApiTokenByToken` doesn't include them in its select)
+  - `packages/api/v1/contract.ts` — spreads `AdminContract` into `ApiContractV1` (3 line addition)
+  - `packages/api/v1/implementation.ts` — spreads `adminImplementation` into router (3 line addition)
+- **Endpoints:**
+  - `POST   /api/v1/admin/organisations` — create org owned by `ownerEmail` (user must exist)
+  - `GET    /api/v1/admin/organisations` — paginated list, optional `?ownerEmail=` filter
+  - `GET    /api/v1/admin/organisations/:organisationId`
+  - `PATCH  /api/v1/admin/organisations/:organisationId` — name/url
+  - `DELETE /api/v1/admin/organisations/:organisationId`
+  - `POST   /api/v1/admin/organisations/:organisationId/members` — add member by email + role
+  - `DELETE /api/v1/admin/organisations/:organisationId/members/:userId`
+  - `POST   /api/v1/admin/users` — create user; password optional (random if omitted, user must reset via forgot-password)
+  - `GET    /api/v1/admin/users` — paginated list, optional `?email=` filter
+  - `GET    /api/v1/admin/users/:userId`
+  - `PATCH  /api/v1/admin/users/:userId` — name/email/disabled
+- **Remove when:** upstream adds these (or equivalent) to the public REST API.
 
-### 1. Admin REST API for Organisations + Users
-- **REST surface lives in:** `packages/api/v1/` (Hono + ts-rest, mounted via `packages/api/hono.ts`). Files: `contract.ts` (request/response zod schemas), `implementation.ts` (handlers), `openapi.ts` (OpenAPI doc generation), `schema.ts` (shared types).
-- **Underlying tRPC procedures:** `packages/trpc/server/organisation-router/` (create-organisation, create-organisation-member-invites, etc.) — the patch wraps these.
-- **Problem:** v1.12.10's public REST API only covers documents + templates. Org / user management is internal tRPC only.
-- **Fix:** extend `packages/api/v1/contract.ts` with admin org/user endpoints + add corresponding handlers in `packages/api/v1/implementation.ts` that delegate to existing org-router procedures. Auth via the existing API token middleware. New endpoints:
-  - `POST/GET/PATCH/DELETE /api/v1/admin/organisations`
-  - `POST /api/v1/admin/organisations/:id/members`
-  - `DELETE /api/v1/admin/organisations/:id/members/:userId`
-  - `POST/GET/PATCH /api/v1/admin/users`
-- OpenAPI definitions auto-generated from the ts-rest contract — biz-buddy's typed client picks them up via `/api/v1/openapi.json`.
-- **Remove when:** upstream adds these to the public REST API.
+### 2. BIZBUDDY_SIGNING_URL_PREFIX env var — landed 2026-05-01
 
-### 2. BIZBUDDY_SIGNING_URL_PREFIX env var
-- **File:** the signing-email template — likely under `packages/email/` or `apps/remix/server/api/` (verify exact path during patch dev).
-- **Problem:** Documenso's email template hardcodes `NEXT_PUBLIC_WEBAPP_URL` as the signing link prefix. We need the link to go to `bizbuddy.parallel5.com/sign/...` so biz-buddy can run the JIT-register flow before redirecting to Documenso for actual signing.
-- **Fix:** if `BIZBUDDY_SIGNING_URL_PREFIX` env var is set, use it for the signing link in the email template. Falls back to `NEXT_PUBLIC_WEBAPP_URL` if unset (preserves upstream behavior).
-- **Estimated:** ~5 LOC + tests.
+- **Behavior:** if `BIZBUDDY_SIGNING_URL_PREFIX` is set, the recipient invite-email's signing link uses it instead of `NEXT_PUBLIC_WEBAPP_URL`. Falls back to `NEXT_PUBLIC_WEBAPP_URL` when unset (default behavior preserved).
+- **Files (additive only via the helper, plus 3 single-line call-site swaps):**
+  - `packages/lib/constants/app.ts` — adds `SIGNING_LINK_BASE_URL()` helper (env-var-driven with fallback)
+  - `packages/lib/jobs/definitions/emails/send-signing-email.handler.ts` — uses `SIGNING_LINK_BASE_URL()` for `signDocumentLink`
+  - `packages/lib/jobs/definitions/internal/process-signing-reminder.handler.ts` — same swap
+  - `packages/lib/server-only/document/resend-document.ts` — same swap
+- **Other URL constructions** (e.g. `assetBaseUrl` for email images) still use `NEXT_PUBLIC_WEBAPP_URL` — only the per-recipient `/sign/<token>` link is overridden.
+- **Why:** lets biz-buddy intercept signing links to run JIT registration before redirecting to Documenso's signing UI.
+- **Remove when:** upstream adds a configurable signing-URL prefix or a webhook-style "sign initiated" event.
+
+
+
+## Planned Patches
+
+(none — both planned patches landed 2026-05-01; see Active Patches above)
 - **Remove when:** upstream adds a configurable signing-URL-prefix or a webhook-style "sign initiated" event we can intercept to do the redirect ourselves.
 
 ## Maintenance discipline

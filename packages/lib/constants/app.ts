@@ -6,6 +6,15 @@ export const APP_DOCUMENT_UPLOAD_SIZE_LIMIT =
 export const NEXT_PUBLIC_WEBAPP_URL = () =>
   env('NEXT_PUBLIC_WEBAPP_URL') ?? 'http://localhost:3000';
 
+// P5 patch: SIGNING_LINK_BASE_URL allows the recipient invite email to point
+// at a different host than the rest of the app (e.g. biz-buddy intercepting
+// /sign/<token> to run JIT registration before redirecting to Documenso's
+// signing UI). Falls back to NEXT_PUBLIC_WEBAPP_URL so default behavior is
+// unchanged when the env var is unset.
+// See parallelfive/documenso P5_PATCHES.md § Patch 2.
+export const SIGNING_LINK_BASE_URL = () =>
+  env('BIZBUDDY_SIGNING_URL_PREFIX') ?? NEXT_PUBLIC_WEBAPP_URL();
+
 export const NEXT_PUBLIC_SIGNING_CONTACT_INFO = () =>
   env('NEXT_PUBLIC_SIGNING_CONTACT_INFO') ?? NEXT_PUBLIC_WEBAPP_URL();
 
