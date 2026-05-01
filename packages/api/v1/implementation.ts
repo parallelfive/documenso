@@ -56,13 +56,62 @@ import { prisma } from '@documenso/prisma';
 
 // P5 patch: admin REST handlers (org + user CRUD).
 // See parallelfive/documenso P5_PATCHES.md § Patch 1.
-import { adminImplementation } from './admin/implementation';
+import {
+  handleAdminAddOrganisationMember,
+  handleAdminCreateOrganisation,
+  handleAdminCreateUser,
+  handleAdminDeleteOrganisation,
+  handleAdminGetOrganisation,
+  handleAdminGetUser,
+  handleAdminListOrganisations,
+  handleAdminListUsers,
+  handleAdminRemoveOrganisationMember,
+  handleAdminUpdateOrganisation,
+  handleAdminUpdateUser,
+} from './admin/implementation';
 import { ApiContractV1 } from './contract';
+import { adminAuthenticatedMiddleware } from './middleware/admin-authenticated';
 import { authenticatedMiddleware } from './middleware/authenticated';
 
 export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
-  // P5 fork extension — admin REST surface. See ./admin/ + P5_PATCHES.md.
-  ...adminImplementation,
+  // ---------- P5 fork extension — admin REST surface ----------
+  // Each handler is wrapped inline (rather than spread from a separate
+  // const) so ts-rest's contract-driven type inference flows through to
+  // the middleware's generic T (otherwise T solves to the bare constraint
+  // and args.body/query/params type-error). See P5_PATCHES.md § Patch 1.
+  adminCreateOrganisation: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminCreateOrganisation(args.body),
+  ),
+  adminListOrganisations: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminListOrganisations(args.query),
+  ),
+  adminGetOrganisation: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminGetOrganisation(args.params.organisationId),
+  ),
+  adminUpdateOrganisation: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminUpdateOrganisation(args.params.organisationId, args.body),
+  ),
+  adminDeleteOrganisation: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminDeleteOrganisation(args.params.organisationId),
+  ),
+  adminAddOrganisationMember: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminAddOrganisationMember(args.params.organisationId, args.body),
+  ),
+  adminRemoveOrganisationMember: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminRemoveOrganisationMember(args.params.organisationId, args.params.userId),
+  ),
+  adminCreateUser: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminCreateUser(args.body),
+  ),
+  adminListUsers: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminListUsers(args.query),
+  ),
+  adminGetUser: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminGetUser(args.params.userId),
+  ),
+  adminUpdateUser: adminAuthenticatedMiddleware(async (args) =>
+    handleAdminUpdateUser(args.params.userId, args.body),
+  ),
 
   getDocuments: authenticatedMiddleware(async (args, user, team) => {
     const page = Number(args.query.page) || 1;

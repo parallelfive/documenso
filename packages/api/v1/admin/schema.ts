@@ -26,7 +26,7 @@ export const ZAdminOrganisationResponseSchema = z.object({
 
 export const ZAdminCreateOrganisationRequestSchema = z.object({
   name: z.string().min(1).max(255),
-  ownerEmail: zEmail.describe(
+  ownerEmail: zEmail().describe(
     'Email of the user who will own the new organisation. The user must already exist; create them via POST /api/v1/admin/users first if needed.',
   ),
   url: z
@@ -41,7 +41,7 @@ export const ZAdminCreateOrganisationRequestSchema = z.object({
 export const ZAdminListOrganisationsQuerySchema = z.object({
   page: z.coerce.number().min(1).optional().default(1),
   perPage: z.coerce.number().min(1).max(100).optional().default(20),
-  ownerEmail: zEmail.optional().describe('Filter by owner email.'),
+  ownerEmail: zEmail().optional().describe('Filter by owner email.'),
 });
 
 export const ZAdminListOrganisationsResponseSchema = z.object({
@@ -61,7 +61,7 @@ export const ZAdminDeleteOrganisationResponseSchema = z.object({
 // ---------- organisation members ----------
 
 export const ZAdminAddOrganisationMemberRequestSchema = z.object({
-  email: zEmail.describe(
+  email: zEmail().describe(
     'Email of the user to add. The user must already exist; create them via POST /api/v1/admin/users first if needed.',
   ),
   role: z.nativeEnum(OrganisationMemberRole).default(OrganisationMemberRole.MEMBER),
@@ -92,7 +92,7 @@ export const ZAdminUserResponseSchema = z.object({
 });
 
 export const ZAdminCreateUserRequestSchema = z.object({
-  email: zEmail,
+  email: zEmail(),
   name: z.string().min(1).max(255),
   password: z
     .string()
@@ -107,7 +107,7 @@ export const ZAdminCreateUserRequestSchema = z.object({
 export const ZAdminListUsersQuerySchema = z.object({
   page: z.coerce.number().min(1).optional().default(1),
   perPage: z.coerce.number().min(1).max(100).optional().default(20),
-  email: zEmail.optional().describe('Exact email match.'),
+  email: zEmail().optional().describe('Exact email match.'),
 });
 
 export const ZAdminListUsersResponseSchema = z.object({
@@ -117,6 +117,6 @@ export const ZAdminListUsersResponseSchema = z.object({
 
 export const ZAdminUpdateUserRequestSchema = z.object({
   name: z.string().min(1).max(255).optional(),
-  email: zEmail.optional(),
+  email: zEmail().optional(),
   disabled: z.boolean().optional(),
 });
