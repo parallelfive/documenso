@@ -30,7 +30,13 @@ const c = initContract();
 const adminDescription =
   'Parallel Five fork extension. Requires an API token belonging to a user with the global ADMIN role. Not part of the upstream Documenso public API.';
 
-export const AdminContract = {
+// Wrap with c.router() so literal types on `path` are preserved when this
+// is spread into ApiContractV1. Without it the path strings widen to
+// `string` and ts-rest's :param template-literal extraction breaks → the
+// inferred handler args lose `params`. (Caught the hard way in build run
+// 25224341156. See P5_PATCHES.md § Patch 1 wiring quirk for the bigger
+// picture on type-inference traps.)
+export const AdminContract = c.router({
   // ---------- organisations ----------
 
   adminCreateOrganisation: {
@@ -177,4 +183,4 @@ export const AdminContract = {
     summary: 'Update a user',
     description: adminDescription,
   },
-};
+});
