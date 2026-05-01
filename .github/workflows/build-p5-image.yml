@@ -51,7 +51,11 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.p5
+          # Build from source via upstream's docker/Dockerfile — Node/TS
+          # forks can't overlay files onto a prebuilt image (see the
+          # Dockerfile.p5 docstring for why). Our patches live in the
+          # source tree at apps/ + packages/, not as overlay COPY lines.
+          file: docker/Dockerfile
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
