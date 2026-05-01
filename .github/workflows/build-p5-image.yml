@@ -46,6 +46,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # QEMU is required for cross-platform builds — buildx can target
+      # linux/arm64 from an amd64 runner via emulation. Same setup the
+      # parallelfive/coolify fork uses.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/build-push-action@v6
@@ -56,6 +63,12 @@ jobs:
           # Dockerfile.p5 docstring for why). Our patches live in the
           # source tree at apps/ + packages/, not as overlay COPY lines.
           file: docker/Dockerfile
+          # Multi-arch — amd64 for prod's Coolify host (Linux x86_64) +
+          # arm64 so Apple Silicon can pull this image straight into
+          # local-dev docker compose without falling back to upstream
+          # documenso/documenso. See biz-buddy's docker-compose.dev.yml
+          # comment block for the constraint this unblocks.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
