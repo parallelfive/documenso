@@ -6,6 +6,10 @@ on:
 
 jobs:
   stale:
+    # Skip on the parallelfive fork — we don't triage issues here, all upstream
+    # issue management lives on documenso/documenso. Without this guard the
+    # cron fires every 8h on our fork doing nothing useful.
+    if: github.repository == 'documenso/documenso'
     runs-on: ubuntu-latest
     permissions:
       issues: write

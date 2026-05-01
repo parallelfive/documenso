@@ -1,0 +1,26 @@
+# Parallel Five custom Documenso image
+#
+# Extends the official upstream image with patches needed for the Parallel
+# Five biz-buddy ↔ Documenso integration. Re-build when upstream releases
+# a new version OR when adding new patches.
+#
+# Build: ghcr.io/parallelfive/documenso:latest
+# Built by: .github/workflows/build-p5-image.yml on push to p5/patched +
+#           weekly cron (to pick up upstream base image updates).
+#
+# To pin a specific upstream version, change the FROM tag below from
+# `latest` to a specific tag like `v1.12.10`. The fork's own image gets
+# tagged with the matching version + `latest`.
+#
+# Pattern matches our parallelfive/coolify fork — see ~/parallel5/coolify
+# for the precedent.
+
+FROM documenso/documenso:latest
+
+# Patches go here. Each patch should be one COPY line that overlays a
+# patched file from this fork onto the upstream image's filesystem.
+# Document each patch in P5_PATCHES.md with rationale + removal criteria.
+
+# (no patches yet — the bare image is identical to upstream until we
+# land the integration patches: REST endpoints for Org/User management
+# and BIZBUDDY_SIGNING_URL_PREFIX support in the email template)

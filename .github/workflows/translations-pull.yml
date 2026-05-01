@@ -14,6 +14,9 @@ concurrency:
 
 jobs:
   pull_translations:
+    # Skip on the parallelfive fork — Crowdin secrets only live in upstream's
+    # repo, so this would fail loudly every 2h on our fork.
+    if: github.repository == 'documenso/documenso'
     name: Pull translations
     runs-on: ubuntu-latest
     environment: Translations
