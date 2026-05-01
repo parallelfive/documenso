@@ -48,13 +48,14 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
 - **Image surface:** `/api/v1/admin/organisations` + `/api/v1/admin/users` (full CRUD + member add/remove)
 - **OpenAPI:** auto-published in `/api/v1/openapi.json` via the existing ts-rest → OpenAPI pipeline
 - **Auth:** new `adminAuthenticatedMiddleware` — wraps `authenticatedMiddleware`, additionally requires `Role.ADMIN` on the API token's owner
-- **Files (additive — patch is self-contained except for ~10 lines wiring it into the main contract + implementation):**
+- **Files (additive — patch is self-contained except for ~50 lines wiring it into the main contract + implementation):**
   - `packages/api/v1/admin/contract.ts` — ts-rest contract for the admin endpoints
   - `packages/api/v1/admin/schema.ts` — zod request/response schemas
-  - `packages/api/v1/admin/implementation.ts` — handlers; wraps `createOrganisation`, `createUser`, `getUserByEmail` lib helpers + direct prisma for org/user reads + member add/remove
+  - `packages/api/v1/admin/implementation.ts` — pure async handler helpers (no middleware wrapping — see "Wiring quirk" below); wraps `createOrganisation`, `createUser`, `getUserByEmail` lib helpers + direct prisma for org/user reads + member add/remove
   - `packages/api/v1/middleware/admin-authenticated.ts` — admin guard middleware (re-fetches `roles` since upstream `getApiTokenByToken` doesn't include them in its select)
   - `packages/api/v1/contract.ts` — spreads `AdminContract` into `ApiContractV1` (3 line addition)
-  - `packages/api/v1/implementation.ts` — spreads `adminImplementation` into router (3 line addition)
+  - `packages/api/v1/implementation.ts` — wires each admin handler inline (~40 lines) at the `tsr.router(...)` call site
+- **Wiring quirk — handlers must be inlined, not spread:** Admin handlers can't be pre-built into a separate `adminImplementation` const + spread into `tsr.router({...})`. ts-rest's contract-driven type inference only fires at the immediate `tsr.router(contract, impls)` call site — when handlers are pre-built outside that scope, the `adminAuthenticatedMiddleware` generic `T` solves to its bare constraint (`{headers: {authorization}}`) and `args.body/query/params` become `never`. So `admin/implementation.ts` exports pure async helpers and `implementation.ts` does the inline middleware wrapping. Same trap will hit anyone who tries to extract the spread later.
 - **Endpoints:**
   - `POST   /api/v1/admin/organisations` — create org owned by `ownerEmail` (user must exist)
   - `GET    /api/v1/admin/organisations` — paginated list, optional `?ownerEmail=` filter
