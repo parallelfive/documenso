@@ -20,7 +20,7 @@ ghcr.io/parallelfive/documenso:latest
 
 Built automatically by GitHub Actions on push to `p5/patched` and weekly (to pick up upstream + base image updates).
 
-**Architectures:** `linux/amd64` (prod's Coolify host) + `linux/arm64` (Apple Silicon dev boxes). Multi-arch buildx via QEMU on the GHA runner — see `.github/workflows/build-p5-image.yml`. The `linux/arm64` slice exists so biz-buddy's local-dev `docker compose` can pull our fork directly instead of falling back to upstream `documenso/documenso`.
+**Architectures:** `linux/amd64` (prod's Coolify host) + `linux/arm64` (Apple Silicon dev boxes). Built in parallel on native amd64 + arm64 GitHub runners; merged into a multi-platform manifest. ~6 min wall clock instead of ~50 min for QEMU emulation. See `.github/workflows/build-p5-image.yml`. The `linux/arm64` slice exists so biz-buddy's local-dev `docker compose` can pull our fork directly instead of falling back to upstream `documenso/documenso`.
 
 ## Branch Layout
 
