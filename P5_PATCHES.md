@@ -8,7 +8,7 @@ Documenso v1.12.10's public REST API only covers `/documents` and `/templates`. 
 
 - **Workspace → Documenso Organisation auto-provisioning** — when biz-buddy creates a Workspace, biz-buddy provisions a Documenso Organisation via REST
 - **Lazy User → Documenso User mirror** — JIT user creation when a member or recipient first interacts with an envelope
-- **Signing-URL prefix override** — recipient email links go to `bizbuddy.parallel5.com/sign/...` not `sign.parallel5.com/sign/...`, so biz-buddy can run the JIT-register flow before redirecting the user to the Documenso signing page
+- **Scoped signing callback** — Biz Buddy-owned recipient email links go to `bizbuddy.parallel5.com/sign/...` so Biz Buddy can enforce its terminal-state and member-recipient gates before redirecting to Documenso
 
 Rather than reach into Documenso's DB or call internal tRPC routes (both of which break on every Documenso upgrade), we maintain thin patches that expose the surfaces we need as proper REST + env-var-driven config.
 
@@ -24,12 +24,12 @@ Built automatically by GitHub Actions on push to `p5/patched` and weekly (to pic
 
 ## Branch Layout
 
-| Branch | Purpose |
-|---|---|
-| `main` | Upstream mirror (don't commit here — used for fork-sync only) |
-| `p5/patched` | **Our branch** — patches on top of `main`, builds the custom image. Default branch for this fork. |
-| `p5/sync-upstream-*` | Per-rebase branches when bringing in upstream changes (mirrors Coolify fork pattern) |
-| `feat/*` | Per-feature branches when developing a new patch |
+| Branch               | Purpose                                                                                           |
+| -------------------- | ------------------------------------------------------------------------------------------------- |
+| `main`               | Upstream mirror (don't commit here — used for fork-sync only)                                     |
+| `p5/patched`         | **Our branch** — patches on top of `main`, builds the custom image. Default branch for this fork. |
+| `p5/sync-upstream-*` | Per-rebase branches when bringing in upstream changes (mirrors Coolify fork pattern)              |
+| `feat/*`             | Per-feature branches when developing a new patch                                                  |
 
 ## Build mechanism — source build (not overlay)
 
@@ -72,24 +72,65 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   - `PATCH  /api/v1/admin/users/:userId` — name/email/disabled
 - **Remove when:** upstream adds these (or equivalent) to the public REST API.
 
-### 2. BIZBUDDY_SIGNING_URL_PREFIX env var — landed 2026-05-01
+### 2. Scoped Biz Buddy signing callback — landed 2026-05-01, hardened 2026-07-17
 
-- **Behavior:** if `BIZBUDDY_SIGNING_URL_PREFIX` is set, the recipient invite-email's signing link uses it instead of `NEXT_PUBLIC_WEBAPP_URL`. Falls back to `NEXT_PUBLIC_WEBAPP_URL` when unset (default behavior preserved).
-- **Files (additive only via the helper, plus 3 single-line call-site swaps):**
-  - `packages/lib/constants/app.ts` — adds `SIGNING_LINK_BASE_URL()` helper (env-var-driven with fallback)
-  - `packages/lib/jobs/definitions/emails/send-signing-email.handler.ts` — uses `SIGNING_LINK_BASE_URL()` for `signDocumentLink`
-  - `packages/lib/jobs/definitions/internal/process-signing-reminder.handler.ts` — same swap
-  - `packages/lib/server-only/document/resend-document.ts` — same swap
-- **Other URL constructions** (e.g. `assetBaseUrl` for email images) still use `NEXT_PUBLIC_WEBAPP_URL` — only the per-recipient `/sign/<token>` link is overridden.
-- **Why:** lets biz-buddy intercept signing links to run JIT registration before redirecting to Documenso's signing UI.
-- **Remove when:** upstream adds a configurable signing-URL prefix or a webhook-style "sign initiated" event.
+- **Ownership contract:** Biz Buddy sends `externalId=bizbuddy:<local envelope UUID>`.
+  Only that exact, validated namespace activates the callback. Native/manual
+  Documenso documents, arbitrary external IDs, and malformed Biz Buddy IDs keep
+  the native Documenso `/sign/<recipient token>` URL.
+- **Email link:** when `BIZBUDDY_SIGNING_URL_PREFIX` is set, a Biz Buddy-owned
+  recipient invite, reminder, or resend uses
+  `<prefix>/sign/<local envelope UUID>?p=<Documenso recipient token>`.
+  Biz Buddy uses the provider token as the recipient capability, resolves it
+  only within the named envelope, applies terminal/member gates, and redirects
+  to Documenso.
+- **Normalization:** the prefix may be either a host/base path or end in
+  `/sign` (with or without a trailing slash). The helper strips the trailing
+  segment before assembling the callback, so `/sign/sign/...` is never emitted.
+- **Fallback:** an unset/blank prefix always uses `NEXT_PUBLIC_WEBAPP_URL`.
+- **Files:**
+  - `.env.example` — documents the fork-only callback env var.
+  - `packages/lib/constants/app.ts` — `buildRecipientSigningLink()` validates
+    ownership, normalizes the prefix, and constructs the capability URL.
+  - `packages/lib/jobs/definitions/emails/send-signing-email.handler.ts` —
+    passes `envelope.externalId` and the recipient token to the helper.
+  - `packages/lib/jobs/definitions/internal/process-signing-reminder.handler.ts`
+    — same contract for scheduled reminders.
+  - `packages/lib/server-only/document/resend-document.ts` — same contract for
+    explicit resends.
+  - `packages/lib/constants/app.test.ts` — covers every supported prefix shape,
+    token encoding, native fallback, arbitrary IDs, and malformed namespaces.
+- **Other URL constructions** such as email image `assetBaseUrl` still use
+  `NEXT_PUBLIC_WEBAPP_URL`.
+- **Security:** the `p` query value is Documenso's per-recipient bearer token.
+  Do not log it, expose it through operator APIs, analytics, or monitoring
+  query capture.
+- **Remove when:** upstream supports a scoped external signing callback with
+  equivalent ownership discrimination and native fallback.
 
+### 3. API v1 per-envelope expiration metadata — landed 2026-07-17
 
+- **Behavior:** `POST /api/v1/documents` accepts
+  `meta.envelopeExpirationPeriod` using Documenso's existing
+  `ZEnvelopeExpirationPeriod` shape. Biz Buddy sends
+  `{ unit: "day", amount: expiresInDays }`.
+- **Why:** `DocumentMeta` and `sendDocument` already support expiration and set
+  each recipient's concrete `expiresAt`; the public create schema previously
+  gave API clients no way to populate that field.
+- **Files:**
+  - `packages/api/v1/schema.ts` — additive optional field.
+  - `packages/api/v1/create-document-meta.ts` — tested create-input-to-envelope
+    metadata mapper used by the implementation.
+  - `packages/api/v1/implementation.ts` — persists the parsed value through
+    `createEnvelope`.
+  - `packages/api/v1/schema.test.ts` and
+    `packages/api/v1/create-document-meta.test.ts` — validation and persistence
+    mapping coverage.
+- **Remove when:** upstream exposes the same API v1 create field.
 
 ## Planned Patches
 
-(none — both planned patches landed 2026-05-01; see Active Patches above)
-- **Remove when:** upstream adds a configurable signing-URL-prefix or a webhook-style "sign initiated" event we can intercept to do the redirect ourselves.
+(none — all patches are active and documented above)
 
 ## Maintenance discipline
 
