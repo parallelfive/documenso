@@ -18,7 +18,9 @@ Rather than reach into Documenso's DB or call internal tRPC routes (both of whic
 ghcr.io/parallelfive/documenso:latest
 ```
 
-Built automatically by GitHub Actions on push to `p5/patched` and weekly (to pick up upstream + base image updates).
+Built automatically by GitHub Actions on push to `p5/patched` and weekly (to
+refresh mutable base-image layers). Upstream Documenso source changes are
+included only after the intentional `p5/patched` rebase described below.
 
 **Architectures:** `linux/amd64` (prod's Coolify host) + `linux/arm64` (Apple Silicon dev boxes). Built in parallel on native amd64 + arm64 GitHub runners; merged into a multi-platform manifest. ~6 min wall clock instead of ~50 min for QEMU emulation. See `.github/workflows/build-p5-image.yml`. The `linux/arm64` slice exists so biz-buddy's local-dev `docker compose` can pull our fork directly instead of falling back to upstream `documenso/documenso`.
 
@@ -137,5 +139,7 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
 
 - Every Documenso upstream release → rebase `p5/patched` against `main`. See Coolify fork's docs for the targeted-rebase-per-file workflow we use to avoid clobbering both upstream changes AND our patches.
 - New patches go in their own commit on `p5/patched` with a clear rationale in this doc.
-- The `Dockerfile.p5` is the single source of truth for which patches are baked into the image — adding a COPY here without a P5_PATCHES.md entry is a code-smell.
+- The `p5/patched` source tree plus this manifest are the source of truth for
+  which patches are baked into the image. `Dockerfile.p5` is only a marker; the
+  workflow builds the patched checkout with upstream's `docker/Dockerfile`.
 - License: AGPLv3. Same as upstream Documenso. Self-hosted modified version → must offer source to network users → this repo IS the public source.
