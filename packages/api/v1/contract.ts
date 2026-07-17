@@ -91,6 +91,23 @@ export const ApiContractV1 = c.router(
       description: deprecatedDescription,
     },
 
+    downloadSignedDocumentData: {
+      method: 'GET',
+      path: '/api/v1/documents/:id/download-data',
+      responses: {
+        200: c.otherResponse({
+          contentType: 'application/pdf',
+          body: c.type<Blob>(),
+        }),
+        400: ZUnsuccessfulResponseSchema,
+        401: ZUnsuccessfulResponseSchema,
+        404: ZUnsuccessfulResponseSchema,
+        413: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
+      },
+      summary: 'Download a completed signed document as PDF across every storage transport',
+    },
+
     createDocument: {
       method: 'POST',
       path: '/api/v1/documents',

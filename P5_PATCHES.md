@@ -131,6 +131,31 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
     mapping coverage.
 - **Remove when:** upstream exposes the same API v1 create field.
 
+### 4. Storage-agnostic signed-PDF API — landed 2026-07-17
+
+- **Behavior:** authenticated
+  `GET /api/v1/documents/:id/download-data` returns the completed,
+  single-item document as raw `application/pdf`. It resolves Documenso's
+  `BYTES`, `BYTES_64`, and `S3_PATH` storage forms through the existing
+  `getFileServerSide()` abstraction and enforces a bounded response size.
+- **Why:** production uses Documenso's default database upload transport.
+  Upstream's `/download` route only returns a presigned URL for S3, so Biz
+  Buddy otherwise cannot durably capture the signed PDF after a completion
+  webhook.
+- **Authorization:** the normal API v1 bearer middleware authenticates the
+  token user/team and the endpoint additionally requires the returned
+  document's `teamId` to equal that token team exactly. Non-completed,
+  multi-item, oversized, invalid, and cross-scope documents fail closed.
+- **Files:**
+  - `packages/api/v1/contract.ts` and `packages/api/v1/implementation.ts` —
+    additive binary endpoint.
+  - `packages/api/v1/download-document-data.ts` — storage-agnostic bounded
+    loader.
+  - `packages/api/v1/download-document-data.test.ts` — completed, auth-scope,
+    lifecycle, item-count, size, and content validation.
+- **Remove when:** upstream exposes an equivalent storage-agnostic signed
+  document download API.
+
 ## Planned Patches
 
 (none — all patches are active and documented above)

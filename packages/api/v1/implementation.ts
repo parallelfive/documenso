@@ -71,6 +71,7 @@ import {
 } from './admin/implementation';
 import { ApiContractV1 } from './contract';
 import { buildCreateDocumentMeta } from './create-document-meta';
+import { downloadSignedDocumentData } from './download-document-data';
 import { adminAuthenticatedMiddleware } from './middleware/admin-authenticated';
 import { authenticatedMiddleware } from './middleware/authenticated';
 
@@ -340,6 +341,29 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
         },
       };
     }
+  }),
+
+  downloadSignedDocumentData: authenticatedMiddleware(async (args, user, team, { logger }) => {
+    const documentId = Number(args.params.id);
+
+    logger.info({
+      input: {
+        id: args.params.id,
+      },
+    });
+
+    if (!Number.isSafeInteger(documentId) || documentId <= 0) {
+      return {
+        status: 404,
+        body: { message: 'Document not found' },
+      };
+    }
+
+    return downloadSignedDocumentData({
+      documentId,
+      userId: user.id,
+      teamId: team.id,
+    });
   }),
 
   deleteDocument: authenticatedMiddleware(async (args, user, team, { logger, metadata }) => {
