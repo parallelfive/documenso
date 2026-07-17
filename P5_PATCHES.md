@@ -8,7 +8,7 @@ Documenso v1.12.10's public REST API only covers `/documents` and `/templates`. 
 
 - **Workspace → Documenso Organisation auto-provisioning** — when biz-buddy creates a Workspace, biz-buddy provisions a Documenso Organisation via REST
 - **Lazy User → Documenso User mirror** — JIT user creation when a member or recipient first interacts with an envelope
-- **Scoped signing callback** — Biz Buddy-owned recipient email links go to `bizbuddy.parallel5.com/sign/...` so Biz Buddy can enforce its terminal-state and member-recipient gates before redirecting to Documenso
+- **Scoped signing callback** — Biz Buddy-owned recipient email links go to `bizbuddy.parallel5.com/sign/...` so Biz Buddy can enforce terminal state and fresh active-workspace membership for member recipients before redirecting to Documenso
 
 Rather than reach into Documenso's DB or call internal tRPC routes (both of which break on every Documenso upgrade), we maintain thin patches that expose the surfaces we need as proper REST + env-var-driven config.
 
@@ -82,8 +82,9 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   recipient invite, reminder, or resend uses
   `<prefix>/sign/<local envelope UUID>?p=<Documenso recipient token>`.
   Biz Buddy uses the provider token as the recipient capability, resolves it
-  only within the named envelope, applies terminal/member gates, and redirects
-  to Documenso.
+  only within the named envelope, applies terminal gates plus a fresh active
+  workspace-membership check for member recipients, and redirects to
+  Documenso.
 - **Normalization:** the prefix may be either a host/base path or end in
   `/sign` (with or without a trailing slash). The helper strips the trailing
   segment before assembling the callback, so `/sign/sign/...` is never emitted.
