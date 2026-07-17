@@ -6,14 +6,49 @@ export const APP_DOCUMENT_UPLOAD_SIZE_LIMIT =
 export const NEXT_PUBLIC_WEBAPP_URL = () =>
   env('NEXT_PUBLIC_WEBAPP_URL') ?? 'http://localhost:3000';
 
-// P5 patch: SIGNING_LINK_BASE_URL allows the recipient invite email to point
-// at a different host than the rest of the app (e.g. biz-buddy intercepting
-// /sign/<token> to run JIT registration before redirecting to Documenso's
-// signing UI). Falls back to NEXT_PUBLIC_WEBAPP_URL so default behavior is
-// unchanged when the env var is unset.
-// See parallelfive/documenso P5_PATCHES.md § Patch 2.
-export const SIGNING_LINK_BASE_URL = () =>
-  env('BIZBUDDY_SIGNING_URL_PREFIX') ?? NEXT_PUBLIC_WEBAPP_URL();
+const stripTrailingSlashes = (value: string) => value.trim().replace(/\/+$/, '');
+const BIZBUDDY_EXTERNAL_ID_PATTERN =
+  /^bizbuddy:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+
+/**
+ * Build the recipient-facing signing link.
+ *
+ * Biz Buddy documents carry their namespaced local envelope ID in `externalId`.
+ * When the callback prefix is configured, that ID and Documenso's recipient
+ * capability token are routed through Biz Buddy so it can enforce its
+ * terminal-state and workspace-recipient gates before returning the signer to
+ * Documenso.
+ *
+ * Documents without a Biz Buddy external ID keep Documenso's native signing
+ * link, including when the callback prefix is configured.
+ */
+export const buildRecipientSigningLink = ({
+  externalId,
+  recipientToken,
+  signingUrlPrefix = env('BIZBUDDY_SIGNING_URL_PREFIX'),
+  webappUrl = NEXT_PUBLIC_WEBAPP_URL(),
+}: {
+  externalId: string | null | undefined;
+  recipientToken: string;
+  signingUrlPrefix?: string;
+  webappUrl?: string;
+}) => {
+  const encodedRecipientToken = encodeURIComponent(recipientToken);
+
+  const bizBuddyEnvelopeId = externalId?.match(BIZBUDDY_EXTERNAL_ID_PATTERN)?.[1];
+  const callbackPrefix = signingUrlPrefix?.trim();
+
+  if (!callbackPrefix || !bizBuddyEnvelopeId) {
+    return `${stripTrailingSlashes(webappUrl)}/sign/${encodedRecipientToken}`;
+  }
+
+  // Accept either an origin/base path or a value already ending in `/sign`.
+  // This keeps existing operator configuration compatible without ever
+  // constructing `/sign/sign/...`.
+  const callbackBase = stripTrailingSlashes(callbackPrefix).replace(/\/sign$/, '');
+
+  return `${callbackBase}/sign/${bizBuddyEnvelopeId}?p=${encodedRecipientToken}`;
+};
 
 export const NEXT_PUBLIC_SIGNING_CONTACT_INFO = () =>
   env('NEXT_PUBLIC_SIGNING_CONTACT_INFO') ?? NEXT_PUBLIC_WEBAPP_URL();

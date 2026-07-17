@@ -13,6 +13,7 @@ import { TemplateType } from '@prisma/client';
 import { z } from 'zod';
 
 import { DATE_FORMATS, DEFAULT_DOCUMENT_DATE_FORMAT } from '@documenso/lib/constants/date-formats';
+import { ZEnvelopeExpirationPeriod } from '@documenso/lib/constants/envelope-expiration';
 import { SUPPORTED_LANGUAGE_CODES } from '@documenso/lib/constants/i18n';
 import { DEFAULT_DOCUMENT_TIME_ZONE, TIME_ZONES } from '@documenso/lib/constants/time-zones';
 import { ZUrlSchema } from '@documenso/lib/schemas/common';
@@ -182,6 +183,7 @@ export const ZCreateDocumentMutationSchema = z.object({
       drawSignatureEnabled: z.boolean().optional().default(true),
       distributionMethod: z.nativeEnum(DocumentDistributionMethod).optional(),
       emailSettings: ZDocumentEmailSettingsSchema.optional(),
+      envelopeExpirationPeriod: ZEnvelopeExpirationPeriod.optional(),
     })
     .partial()
     .optional()

@@ -70,6 +70,7 @@ import {
   handleAdminUpdateUser,
 } from './admin/implementation';
 import { ApiContractV1 } from './contract';
+import { buildCreateDocumentMeta } from './create-document-meta';
 import { adminAuthenticatedMiddleware } from './middleware/admin-authenticated';
 import { authenticatedMiddleware } from './middleware/authenticated';
 
@@ -486,21 +487,11 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
           globalActionAuth: body.authOptions?.globalActionAuth,
         },
         attachments: body.attachments,
-        meta: {
-          subject: body.meta.subject,
-          message: body.meta.message,
+        meta: buildCreateDocumentMeta({
+          meta: body.meta,
           timezone,
           dateFormat: dateFormat?.value,
-          redirectUrl: body.meta.redirectUrl,
-          signingOrder: body.meta.signingOrder,
-          allowDictateNextSigner: body.meta.allowDictateNextSigner,
-          language: body.meta.language,
-          typedSignatureEnabled: body.meta.typedSignatureEnabled,
-          uploadSignatureEnabled: body.meta.uploadSignatureEnabled,
-          drawSignatureEnabled: body.meta.drawSignatureEnabled,
-          distributionMethod: body.meta.distributionMethod,
-          emailSettings: body.meta.emailSettings,
-        },
+        }),
         requestMetadata: metadata,
       });
 
