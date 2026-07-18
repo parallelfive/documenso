@@ -331,7 +331,11 @@ export const processDocumentDataStorageCleanup = async ({
 type ProcessDocumentDataStorageCleanupAfterCommitOptions = {
   cleanupIds: string[];
   envelopeId: string;
-  event: 'document-cancelled' | 'document-snapshot-abandoned' | 'document-source-retired';
+  event:
+    | 'document-admin-deleted'
+    | 'document-cancelled'
+    | 'document-snapshot-abandoned'
+    | 'document-source-retired';
 };
 
 /**

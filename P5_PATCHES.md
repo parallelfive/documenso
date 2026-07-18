@@ -478,16 +478,18 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
 ### 8. Durable document-data and object retirement — landed 2026-07-18
 
 - **Why:** deleting a draft or pending envelope cascaded `EnvelopeItem` rows
-  but left their `DocumentData` rows and S3 objects. Correlated atomic send also
-  replaced the client-upload source with an immutable snapshot without
-  retiring the now-unreferenced source. A successful API cancellation could
-  therefore return 404 for the envelope while retaining both source and
-  snapshot PDFs.
-- **Transactional retirement:** hard delete locks the envelope and its current
-  items, repeats the legal-state delete predicate, then in the same transaction
-  stages every unique S3 key, deletes every now-unreferenced `DocumentData`
-  row, and commits the cancellation. Atomic send stages the detached source in
-  the snapshot-attach transaction. Duplicate/save-as-template locks and
+  but left their `DocumentData` rows and S3 objects. The administrator's
+  unconditional hard-delete path had the same leak for completed envelopes.
+  Correlated atomic send also replaced the client-upload source with an
+  immutable snapshot without retiring the now-unreferenced source. A
+  successful cancellation or admin deletion could therefore remove the
+  envelope while retaining source and snapshot PDFs.
+- **Transactional retirement:** native/API and admin hard delete lock the
+  envelope and its current items, then in the same transaction stage every
+  unique S3 key, delete every now-unreferenced `DocumentData` row, and commit
+  the deletion; the cancellable path also repeats its legal-state predicate.
+  Atomic send stages the detached source in the snapshot-attach transaction.
+  Duplicate/save-as-template locks and
   revalidates every source row before creating its target graph, so
   cancellation cannot leave a partial copy or an untracked shared reference.
   Database-backed `BYTES`/`BYTES_64` content is deleted with its row and is
@@ -530,8 +532,8 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   so worker/acknowledgement races safely repeat. No key or PDF content is
   emitted to logs.
 - **Durable retry:** cleanup runs synchronously after commit for prompt
-  retirement but never turns a committed send/cancellation into a false
-  rollback. Failed tasks retain attempt metadata and a bounded,
+  retirement but never turns a committed send, cancellation, or admin deletion
+  into a false rollback. Failed tasks retain attempt metadata and a bounded,
   four-concurrent, 100-task cron sweep retries every 15 minutes. Each cleanup
   `DeleteObject` has a 15-second deadline; a timeout retains the task instead of
   hanging a committed API response or worker slot. The release migration, run
@@ -553,8 +555,9 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   - `packages/lib/server-only/document-data/{stage,process}-document-data-storage-cleanup.ts`
     — transactional staging/locking, provisional reservation/binding/release,
     reference-safe DeleteObject, and guarded acknowledgement.
-  - `packages/lib/server-only/document/{send-document,delete-document}.ts` —
-    source retirement and native/API hard-delete integration.
+  - `packages/lib/server-only/document/{send-document,delete-document}.ts` and
+    `packages/lib/server-only/admin/admin-super-delete-document.ts` — source
+    retirement plus native/API/admin hard-delete integration.
   - `packages/lib/server-only/envelope/duplicate-envelope.ts` and
     `packages/lib/jobs/definitions/internal/seal-document-storage.ts` —
     atomic shared-key duplication and crash-safe seal attachment/retirement.
