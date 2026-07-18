@@ -70,7 +70,9 @@ import {
 } from '../../utils/recipients';
 import { processDocumentDataStorageCleanupAfterCommit } from '../document-data/process-document-data-storage-cleanup';
 import {
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
   getDocumentDataPresignReplayNotBefore,
+  lockDocumentDataStorageKeys,
   releaseProvisionalDocumentDataStorageCleanup,
   stageDocumentDataStorageCleanup,
 } from '../document-data/stage-document-data-storage-cleanup';
@@ -85,6 +87,7 @@ const ATOMIC_EXECUTION_PDF_READ_TIMEOUT_MS = 30_000;
 type PreparedExecutionPdfSnapshot = {
   sourceEnvelopeItemId: string;
   sourceDocumentDataId: string;
+  sourceStorageKeys: string[];
   documentData: DocumentData;
 };
 
@@ -285,6 +288,10 @@ export const sendDocument = async ({
     preparedExecutionPdfSnapshot = {
       sourceEnvelopeItemId: sourceEnvelopeItem.id,
       sourceDocumentDataId: sourceEnvelopeItem.documentData.id,
+      sourceStorageKeys:
+        sourceEnvelopeItem.documentData.type === DocumentDataType.S3_PATH
+          ? [sourceEnvelopeItem.documentData.data, sourceEnvelopeItem.documentData.initialData]
+          : [],
       documentData,
     };
   }
@@ -359,6 +366,26 @@ export const sendDocument = async ({
   const attachPreparedExecutionPdfSnapshot = async (tx: Prisma.TransactionClient) => {
     if (!preparedExecutionPdfSnapshot) return;
 
+    await lockDocumentDataStorageKeys({
+      tx,
+      keys: [
+        ...preparedExecutionPdfSnapshot.sourceStorageKeys,
+        ...(preparedExecutionPdfSnapshot.documentData.type === DocumentDataType.S3_PATH
+          ? [
+              preparedExecutionPdfSnapshot.documentData.data,
+              preparedExecutionPdfSnapshot.documentData.initialData,
+            ]
+          : []),
+      ],
+    });
+
+    if (preparedExecutionPdfSnapshot.documentData.type === DocumentDataType.S3_PATH) {
+      await releaseProvisionalDocumentDataStorageCleanup({
+        tx,
+        documentDataId: preparedExecutionPdfSnapshot.documentData.id,
+      });
+    }
+
     const attached = await tx.envelopeItem.updateMany({
       where: {
         id: preparedExecutionPdfSnapshot.sourceEnvelopeItemId,
@@ -376,13 +403,6 @@ export const sendDocument = async ({
       });
     }
 
-    if (preparedExecutionPdfSnapshot.documentData.type === DocumentDataType.S3_PATH) {
-      await releaseProvisionalDocumentDataStorageCleanup({
-        tx,
-        documentDataId: preparedExecutionPdfSnapshot.documentData.id,
-      });
-    }
-
     sourceStorageCleanupIds = await stageDocumentDataStorageCleanup({
       tx,
       documentDataIds: [preparedExecutionPdfSnapshot.sourceDocumentDataId],
@@ -394,12 +414,16 @@ export const sendDocument = async ({
     if (!preparedExecutionPdfSnapshot) return;
 
     try {
-      const cleanupIds = await prisma.$transaction(async (tx) =>
-        stageDocumentDataStorageCleanup({
-          tx,
-          documentDataIds: [preparedExecutionPdfSnapshot.documentData.id],
-          preserveExistingNotBefore: false,
-        }),
+      const cleanupIds = await prisma.$transaction(
+        async (tx) =>
+          stageDocumentDataStorageCleanup({
+            tx,
+            documentDataIds: [preparedExecutionPdfSnapshot.documentData.id],
+            preserveExistingNotBefore: false,
+          }),
+        {
+          timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+        },
       );
 
       await processDocumentDataStorageCleanupAfterCommit({
@@ -427,60 +451,64 @@ export const sendDocument = async ({
 
     if (mustUseAtomicExecution) {
       try {
-        claimedEnvelope = await prisma.$transaction(async (tx) =>
-          withDocumentDraftMutationGuard(
-            {
-              tx,
-              envelopeId: envelope.id,
-              teamId,
-              expectedExternalId: isBizBuddyExternalId(envelope.externalId)
-                ? envelope.externalId
-                : undefined,
-              transitionToPending: true,
-            },
-            async () => {
-              await assertLockedExecutionLease(tx);
-              await attachPreparedExecutionPdfSnapshot(tx);
+        claimedEnvelope = await prisma.$transaction(
+          async (tx) =>
+            withDocumentDraftMutationGuard(
+              {
+                tx,
+                envelopeId: envelope.id,
+                teamId,
+                expectedExternalId: isBizBuddyExternalId(envelope.externalId)
+                  ? envelope.externalId
+                  : undefined,
+                transitionToPending: true,
+              },
+              async () => {
+                await assertLockedExecutionLease(tx);
+                await attachPreparedExecutionPdfSnapshot(tx);
 
-              if (documentEmailSettings) {
-                const updatedDocumentMeta = await tx.documentMeta.update({
+                if (documentEmailSettings) {
+                  const updatedDocumentMeta = await tx.documentMeta.update({
+                    where: {
+                      id: envelope.documentMetaId,
+                    },
+                    data: {
+                      emailSettings: documentEmailSettings,
+                    },
+                  });
+                  const changes = diffDocumentMetaChanges(
+                    envelope.documentMeta ?? {},
+                    updatedDocumentMeta,
+                  );
+
+                  if (changes.length > 0) {
+                    await tx.documentAuditLog.create({
+                      data: createDocumentAuditLogData({
+                        type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
+                        envelopeId: envelope.id,
+                        metadata: requestMetadata,
+                        data: {
+                          changes,
+                        },
+                      }),
+                    });
+                  }
+                }
+
+                return tx.envelope.findFirstOrThrow({
                   where: {
-                    id: envelope.documentMetaId,
+                    id: envelope.id,
                   },
-                  data: {
-                    emailSettings: documentEmailSettings,
+                  include: {
+                    documentMeta: true,
+                    recipients: true,
                   },
                 });
-                const changes = diffDocumentMetaChanges(
-                  envelope.documentMeta ?? {},
-                  updatedDocumentMeta,
-                );
-
-                if (changes.length > 0) {
-                  await tx.documentAuditLog.create({
-                    data: createDocumentAuditLogData({
-                      type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
-                      envelopeId: envelope.id,
-                      metadata: requestMetadata,
-                      data: {
-                        changes,
-                      },
-                    }),
-                  });
-                }
-              }
-
-              return tx.envelope.findFirstOrThrow({
-                where: {
-                  id: envelope.id,
-                },
-                include: {
-                  documentMeta: true,
-                  recipients: true,
-                },
-              });
-            },
-          ),
+              },
+            ),
+          {
+            timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+          },
         );
       } catch (error) {
         await cleanUpPreparedExecutionPdfSnapshot();
@@ -540,146 +568,156 @@ export const sendDocument = async ({
   }
 
   const updatedEnvelope = await prisma
-    .$transaction(async (tx) => {
-      const mutateDocumentForSend = async () => {
-        if (mustUseAtomicExecution) {
-          await assertLockedExecutionLease(tx);
-          await attachPreparedExecutionPdfSnapshot(tx);
-        }
+    .$transaction(
+      async (tx) => {
+        const mutateDocumentForSend = async () => {
+          if (mustUseAtomicExecution) {
+            await assertLockedExecutionLease(tx);
+            await attachPreparedExecutionPdfSnapshot(tx);
+          }
 
-        if (documentEmailSettings) {
-          const updatedDocumentMeta = await tx.documentMeta.update({
-            where: {
-              id: envelope.documentMetaId,
-            },
-            data: {
-              emailSettings: documentEmailSettings,
-            },
-          });
-          const changes = diffDocumentMetaChanges(envelope.documentMeta ?? {}, updatedDocumentMeta);
+          if (documentEmailSettings) {
+            const updatedDocumentMeta = await tx.documentMeta.update({
+              where: {
+                id: envelope.documentMetaId,
+              },
+              data: {
+                emailSettings: documentEmailSettings,
+              },
+            });
+            const changes = diffDocumentMetaChanges(
+              envelope.documentMeta ?? {},
+              updatedDocumentMeta,
+            );
 
-          if (changes.length > 0) {
+            if (changes.length > 0) {
+              await tx.documentAuditLog.create({
+                data: createDocumentAuditLogData({
+                  type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
+                  envelopeId: envelope.id,
+                  metadata: requestMetadata,
+                  data: {
+                    changes,
+                  },
+                }),
+              });
+            }
+          }
+
+          if (envelope.status === DocumentStatus.DRAFT) {
             await tx.documentAuditLog.create({
               data: createDocumentAuditLogData({
-                type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
+                type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_SENT,
                 envelopeId: envelope.id,
                 metadata: requestMetadata,
-                data: {
-                  changes,
-                },
+                data: {},
               }),
             });
           }
-        }
 
-        if (envelope.status === DocumentStatus.DRAFT) {
-          await tx.documentAuditLog.create({
-            data: createDocumentAuditLogData({
-              type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_SENT,
-              envelopeId: envelope.id,
-              metadata: requestMetadata,
-              data: {},
-            }),
-          });
-        }
+          if (envelope.internalVersion === 2) {
+            const autoInsertedFields = await Promise.all(
+              fieldsToAutoInsert.map(async (field) => {
+                // Warning: Only auto-insert fields if the recipient has not been sent the document yet.
+                return await tx.field.update({
+                  where: {
+                    id: field.fieldId,
+                  },
+                  data: {
+                    customText: field.customText,
+                    inserted: true,
+                  },
+                });
+              }),
+            );
 
-        if (envelope.internalVersion === 2) {
-          const autoInsertedFields = await Promise.all(
-            fieldsToAutoInsert.map(async (field) => {
-              // Warning: Only auto-insert fields if the recipient has not been sent the document yet.
-              return await tx.field.update({
-                where: {
-                  id: field.fieldId,
-                },
+            await tx.documentAuditLog.create({
+              data: createDocumentAuditLogData({
+                type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_FIELDS_AUTO_INSERTED,
+                envelopeId: envelope.id,
                 data: {
-                  customText: field.customText,
-                  inserted: true,
+                  fields: autoInsertedFields.map((field) => ({
+                    fieldId: field.id,
+                    fieldType: field.type,
+                    recipientId: field.recipientId,
+                  })),
                 },
-              });
-            }),
+                // Don't put metadata or user here since it's a system event.
+              }),
+            });
+          }
+
+          const expiresAt = resolveExpiresAt(
+            envelope.documentMeta?.envelopeExpirationPeriod ?? null,
           );
 
-          await tx.documentAuditLog.create({
-            data: createDocumentAuditLogData({
-              type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_FIELDS_AUTO_INSERTED,
-              envelopeId: envelope.id,
+          // Set expiresAt on each recipient that hasn't already signed/rejected.
+          // Exclude CC recipients since they don't sign and shouldn't be subject to expiry.
+          if (expiresAt) {
+            await tx.recipient.updateMany({
+              where: {
+                envelopeId: envelope.id,
+                signingStatus: {
+                  notIn: [SigningStatus.SIGNED, SigningStatus.REJECTED],
+                },
+                role: {
+                  not: RecipientRole.CC,
+                },
+              },
               data: {
-                fields: autoInsertedFields.map((field) => ({
-                  fieldId: field.id,
-                  fieldType: field.type,
-                  recipientId: field.recipientId,
-                })),
+                expiresAt,
+                expirationNotifiedAt: null,
               },
-              // Don't put metadata or user here since it's a system event.
-            }),
-          });
-        }
+            });
+          }
 
-        const expiresAt = resolveExpiresAt(envelope.documentMeta?.envelopeExpirationPeriod ?? null);
-
-        // Set expiresAt on each recipient that hasn't already signed/rejected.
-        // Exclude CC recipients since they don't sign and shouldn't be subject to expiry.
-        if (expiresAt) {
-          await tx.recipient.updateMany({
-            where: {
-              envelopeId: envelope.id,
-              signingStatus: {
-                notIn: [SigningStatus.SIGNED, SigningStatus.REJECTED],
+          if (mustUseAtomicExecution) {
+            return tx.envelope.findFirstOrThrow({
+              where: {
+                id: envelope.id,
               },
-              role: {
-                not: RecipientRole.CC,
+              include: {
+                documentMeta: true,
+                recipients: true,
               },
-            },
-            data: {
-              expiresAt,
-              expirationNotifiedAt: null,
-            },
-          });
-        }
+            });
+          }
 
-        if (mustUseAtomicExecution) {
-          return tx.envelope.findFirstOrThrow({
+          return tx.envelope.update({
             where: {
               id: envelope.id,
+            },
+            data: {
+              status: DocumentStatus.PENDING,
             },
             include: {
               documentMeta: true,
               recipients: true,
             },
           });
+        };
+
+        if (mustUseAtomicExecution) {
+          return withDocumentDraftMutationGuard(
+            {
+              tx,
+              envelopeId: envelope.id,
+              teamId,
+              expectedExternalId: isBizBuddyExternalId(envelope.externalId)
+                ? envelope.externalId
+                : undefined,
+              transitionToPending: true,
+            },
+            mutateDocumentForSend,
+          );
         }
 
-        return tx.envelope.update({
-          where: {
-            id: envelope.id,
-          },
-          data: {
-            status: DocumentStatus.PENDING,
-          },
-          include: {
-            documentMeta: true,
-            recipients: true,
-          },
-        });
-      };
-
-      if (mustUseAtomicExecution) {
-        return withDocumentDraftMutationGuard(
-          {
-            tx,
-            envelopeId: envelope.id,
-            teamId,
-            expectedExternalId: isBizBuddyExternalId(envelope.externalId)
-              ? envelope.externalId
-              : undefined,
-            transitionToPending: true,
-          },
-          mutateDocumentForSend,
-        );
-      }
-
-      return mutateDocumentForSend();
-    })
+        return mutateDocumentForSend();
+      },
+      {
+        timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+      },
+    )
     .catch(async (error: unknown) => {
       await cleanUpPreparedExecutionPdfSnapshot();
       throw error;

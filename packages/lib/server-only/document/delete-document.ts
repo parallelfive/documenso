@@ -23,6 +23,7 @@ import { isRecipientEmailValidForSending } from '../../utils/recipients';
 import { renderEmailWithI18N } from '../../utils/render-email-with-i18n';
 import { processDocumentDataStorageCleanupAfterCommit } from '../document-data/process-document-data-storage-cleanup';
 import {
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
   getDocumentDataPresignReplayNotBefore,
   lockEnvelopeDocumentDataForCleanup,
   stageDocumentDataStorageCleanup,
@@ -207,46 +208,51 @@ const handleDocumentOwnerDelete = async ({
   let storageCleanupIds: string[] = [];
 
   try {
-    deletedEnvelope = await prisma.$transaction(async (tx) => {
-      const documentDataIds = await lockEnvelopeDocumentDataForCleanup({
-        tx,
-        envelopeId: envelope.id,
-      });
-
-      // Currently redundant since deleting a document will delete the audit logs.
-      // However may be useful if we disassociate audit logs and documents if required.
-      await tx.documentAuditLog.create({
-        data: createDocumentAuditLogData({
+    deletedEnvelope = await prisma.$transaction(
+      async (tx) => {
+        const documentDataIds = await lockEnvelopeDocumentDataForCleanup({
+          tx,
           envelopeId: envelope.id,
-          type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_DELETED,
-          metadata: requestMetadata,
-          data: {
-            type: 'HARD',
+        });
+
+        // Currently redundant since deleting a document will delete the audit logs.
+        // However may be useful if we disassociate audit logs and documents if required.
+        await tx.documentAuditLog.create({
+          data: createDocumentAuditLogData({
+            envelopeId: envelope.id,
+            type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_DELETED,
+            metadata: requestMetadata,
+            data: {
+              type: 'HARD',
+            },
+          }),
+        });
+
+        const result = await tx.envelope.delete({
+          where: {
+            id: envelope.id,
+            status: requireCancellableStatus
+              ? {
+                  in: [DocumentStatus.DRAFT, DocumentStatus.PENDING],
+                }
+              : {
+                  not: DocumentStatus.COMPLETED,
+                },
           },
-        }),
-      });
+        });
 
-      const result = await tx.envelope.delete({
-        where: {
-          id: envelope.id,
-          status: requireCancellableStatus
-            ? {
-                in: [DocumentStatus.DRAFT, DocumentStatus.PENDING],
-              }
-            : {
-                not: DocumentStatus.COMPLETED,
-              },
-        },
-      });
+        storageCleanupIds = await stageDocumentDataStorageCleanup({
+          tx,
+          documentDataIds,
+          notBefore: getDocumentDataPresignReplayNotBefore(),
+        });
 
-      storageCleanupIds = await stageDocumentDataStorageCleanup({
-        tx,
-        documentDataIds,
-        notBefore: getDocumentDataPresignReplayNotBefore(),
-      });
-
-      return result;
-    });
+        return result;
+      },
+      {
+        timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+      },
+    );
   } catch (error) {
     if (
       requireCancellableStatus &&

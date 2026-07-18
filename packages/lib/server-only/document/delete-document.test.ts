@@ -80,6 +80,7 @@ vi.mock('../document-data/process-document-data-storage-cleanup', () => ({
 }));
 
 vi.mock('../document-data/stage-document-data-storage-cleanup', () => ({
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS: 35_000,
   getDocumentDataPresignReplayNotBefore: () => new Date('2030-01-01T01:05:00.000Z'),
   lockEnvelopeDocumentDataForCleanup: mocks.lockEnvelopeDocumentDataForCleanup,
   stageDocumentDataStorageCleanup: mocks.stageDocumentDataStorageCleanup,

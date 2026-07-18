@@ -161,6 +161,29 @@ describe('S3 upload checksum policy', () => {
     expect(capturedRequests).toHaveLength(0);
   });
 
+  it('counts a delayed successful reservation against the absolute upload deadline', async () => {
+    const file = new File([Buffer.from('%PDF-1.7\nreservation-delayed\n')], 'delayed.pdf', {
+      type: 'application/pdf',
+    });
+    const dateNow = vi
+      .spyOn(Date, 'now')
+      .mockReturnValueOnce(1_000)
+      .mockReturnValueOnce(1_101);
+
+    try {
+      await expect(
+        uploadS3File(file, {
+          onKeyAllocated: async () => await Promise.resolve(),
+          requestTimeoutMs: 100,
+        }),
+      ).rejects.toThrow('S3 upload exceeded its request deadline');
+    } finally {
+      dateNow.mockRestore();
+    }
+
+    expect(capturedRequests).toHaveLength(0);
+  });
+
   it('aborts a hung reserved PutObject before its cleanup grace can expire', async () => {
     const file = new File([Buffer.from('%PDF-1.7\nhung\n')], 'hung.pdf', {
       type: 'application/pdf',

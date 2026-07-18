@@ -6,6 +6,11 @@ import { prisma } from '@documenso/prisma';
 import { ONE_MINUTE } from '../../constants/time';
 import { deleteS3File } from '../../universal/upload/server-actions';
 import { logger } from '../../utils/logger';
+import {
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+  findLiveDocumentDataStorageReferences,
+  lockDocumentDataStorageKeys,
+} from './stage-document-data-storage-cleanup';
 
 const DEFAULT_CLEANUP_LIMIT = 100;
 const MAX_CLEANUP_LIMIT = 500;
@@ -88,178 +93,191 @@ export const processDocumentDataStorageCleanup = async ({
     cleanupTasks,
     async (cleanupTask) => {
       try {
-        const provisionalDocumentDataId = cleanupTask.documentDataId;
+        return await prisma.$transaction(
+          async (tx) => {
+            await lockDocumentDataStorageKeys({
+              tx,
+              keys: [cleanupTask.key],
+            });
 
-        if (provisionalDocumentDataId) {
-          const provisionalResult = await prisma.$transaction(async (tx) => {
-            const lockedDocumentData = await tx.$queryRaw<Array<{ id: string }>>`
-              SELECT "id"
-              FROM "DocumentData"
-              WHERE "id" = ${provisionalDocumentDataId}
-              FOR UPDATE
-            `;
-
-            if (lockedDocumentData.length === 0) {
-              await tx.documentDataStorageCleanup.updateMany({
-                where: {
-                  id: cleanupTask.id,
-                },
-                data: {
-                  documentDataId: null,
-                  earlyDeleteEnabled: true,
-                },
-              });
-
-              return 'ready' as const;
-            }
-
-            const provisionalDocumentData = await tx.documentData.findUnique({
+            const currentCleanupTask = await tx.documentDataStorageCleanup.findUnique({
               where: {
-                id: provisionalDocumentDataId,
+                id: cleanupTask.id,
               },
               select: {
-                type: true,
-                data: true,
-                initialData: true,
-                envelopeItem: {
-                  select: {
-                    id: true,
-                  },
-                },
+                id: true,
+                key: true,
+                notBefore: true,
+                documentDataId: true,
               },
             });
 
-            const isMatchingUnattachedS3Data =
-              provisionalDocumentData?.type === DocumentDataType.S3_PATH &&
-              provisionalDocumentData.envelopeItem === null &&
-              (provisionalDocumentData.data === cleanupTask.key ||
-                provisionalDocumentData.initialData === cleanupTask.key);
-
-            if (!isMatchingUnattachedS3Data) {
-              await tx.documentDataStorageCleanup.deleteMany({
-                where: {
-                  id: cleanupTask.id,
-                },
-              });
-
+            // Selection is intentionally outside the transaction. The key lock
+            // may have allowed an older task to be acknowledged and replaced
+            // before this worker entered; never act on that later generation.
+            if (!currentCleanupTask || currentCleanupTask.key !== cleanupTask.key) {
               return 'cancelled' as const;
             }
 
-            const retiredDocumentData = await tx.documentData.deleteMany({
-              where: {
-                id: provisionalDocumentDataId,
-                envelopeItem: {
-                  is: null,
-                },
-              },
+            const provisionalDocumentDataId = currentCleanupTask.documentDataId;
+
+            if (provisionalDocumentDataId) {
+              const lockedDocumentData = await tx.$queryRaw<Array<{ id: string }>>`
+                SELECT "id"
+                FROM "DocumentData"
+                WHERE "id" = ${provisionalDocumentDataId}
+                FOR UPDATE
+              `;
+
+              if (lockedDocumentData.length === 0) {
+                await tx.documentDataStorageCleanup.updateMany({
+                  where: {
+                    id: currentCleanupTask.id,
+                    documentDataId: provisionalDocumentDataId,
+                  },
+                  data: {
+                    documentDataId: null,
+                    earlyDeleteEnabled: true,
+                  },
+                });
+              } else {
+                const provisionalDocumentData = await tx.documentData.findUnique({
+                  where: {
+                    id: provisionalDocumentDataId,
+                  },
+                  select: {
+                    type: true,
+                    data: true,
+                    initialData: true,
+                    envelopeItem: {
+                      select: {
+                        id: true,
+                      },
+                    },
+                  },
+                });
+
+                const isMatchingUnattachedS3Data =
+                  provisionalDocumentData?.type === DocumentDataType.S3_PATH &&
+                  provisionalDocumentData.envelopeItem === null &&
+                  (provisionalDocumentData.data === currentCleanupTask.key ||
+                    provisionalDocumentData.initialData === currentCleanupTask.key);
+
+                if (!isMatchingUnattachedS3Data) {
+                  await tx.documentDataStorageCleanup.deleteMany({
+                    where: {
+                      id: currentCleanupTask.id,
+                      documentDataId: provisionalDocumentDataId,
+                    },
+                  });
+
+                  return 'cancelled' as const;
+                }
+
+                const retiredDocumentData = await tx.documentData.deleteMany({
+                  where: {
+                    id: provisionalDocumentDataId,
+                    envelopeItem: {
+                      is: null,
+                    },
+                  },
+                });
+
+                if (retiredDocumentData.count !== 1) {
+                  throw new Error('Provisional snapshot cleanup lost its unreferenced-row guard');
+                }
+
+                await tx.documentDataStorageCleanup.updateMany({
+                  where: {
+                    id: currentCleanupTask.id,
+                    documentDataId: provisionalDocumentDataId,
+                  },
+                  data: {
+                    documentDataId: null,
+                    earlyDeleteEnabled: true,
+                  },
+                });
+              }
+            }
+
+            const liveReferences = await findLiveDocumentDataStorageReferences({
+              tx,
+              keys: [currentCleanupTask.key],
             });
 
-            if (retiredDocumentData.count !== 1) {
-              throw new Error('Provisional snapshot cleanup lost its unreferenced-row guard');
+            if (liveReferences.length > 0) {
+              const referencedTaskNotBefore = new Date(
+                Math.max(
+                  currentCleanupTask.notBefore.getTime(),
+                  Date.now() + REFERENCED_TASK_RECHECK_MS,
+                ),
+              );
+
+              await tx.documentDataStorageCleanup.updateMany({
+                where: {
+                  id: currentCleanupTask.id,
+                  notBefore: {
+                    lte: referencedTaskNotBefore,
+                  },
+                },
+                data: {
+                  notBefore: referencedTaskNotBefore,
+                  earlyDeleteAttemptedAt: new Date(),
+                },
+              });
+
+              return 'deferred' as const;
+            }
+
+            await deleteS3File(currentCleanupTask.key, {
+              requestTimeoutMs: DOCUMENT_DATA_STORAGE_DELETE_TIMEOUT_MS,
+            });
+
+            if (currentCleanupTask.notBefore <= startedAt) {
+              const acknowledgedCleanup = await tx.documentDataStorageCleanup.deleteMany({
+                where: {
+                  id: currentCleanupTask.id,
+                  notBefore: {
+                    lte: startedAt,
+                  },
+                },
+              });
+
+              if (acknowledgedCleanup.count === 1) {
+                return 'acknowledged' as const;
+              }
+
+              const retainedCleanup = await tx.documentDataStorageCleanup.findUnique({
+                where: {
+                  id: currentCleanupTask.id,
+                },
+                select: {
+                  id: true,
+                },
+              });
+
+              return retainedCleanup ? ('early-deleted' as const) : ('acknowledged' as const);
             }
 
             await tx.documentDataStorageCleanup.updateMany({
               where: {
-                id: cleanupTask.id,
+                id: currentCleanupTask.id,
+                notBefore: {
+                  lte: currentCleanupTask.notBefore,
+                },
               },
               data: {
-                documentDataId: null,
-                earlyDeleteEnabled: true,
+                earlyDeleteAttemptedAt: new Date(),
               },
             });
 
-            return 'ready' as const;
-          });
-
-          if (provisionalResult === 'cancelled') {
-            return 'cancelled' as const;
-          }
-        }
-
-        const liveReference = await prisma.documentData.findFirst({
-          where: {
-            type: DocumentDataType.S3_PATH,
-            OR: [{ data: cleanupTask.key }, { initialData: cleanupTask.key }],
+            return 'early-deleted' as const;
           },
-          select: {
-            id: true,
+          {
+            maxWait: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+            timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
           },
-        });
-
-        if (liveReference) {
-          const referencedTaskNotBefore = new Date(
-            Math.max(cleanupTask.notBefore.getTime(), Date.now() + REFERENCED_TASK_RECHECK_MS),
-          );
-
-          await prisma.documentDataStorageCleanup.updateMany({
-            where: {
-              id: cleanupTask.id,
-              notBefore: {
-                lt: referencedTaskNotBefore,
-              },
-            },
-            data: {
-              notBefore: referencedTaskNotBefore,
-            },
-          });
-
-          await prisma.documentDataStorageCleanup.updateMany({
-            where: {
-              id: cleanupTask.id,
-              notBefore: {
-                lte: referencedTaskNotBefore,
-              },
-            },
-            data: {
-              earlyDeleteAttemptedAt: new Date(),
-            },
-          });
-
-          return 'deferred' as const;
-        }
-
-        await deleteS3File(cleanupTask.key, {
-          requestTimeoutMs: DOCUMENT_DATA_STORAGE_DELETE_TIMEOUT_MS,
-        });
-
-        if (cleanupTask.notBefore <= startedAt) {
-          const acknowledgedCleanup = await prisma.documentDataStorageCleanup.deleteMany({
-            where: {
-              id: cleanupTask.id,
-              notBefore: {
-                lte: startedAt,
-              },
-            },
-          });
-
-          if (acknowledgedCleanup.count === 1) {
-            return 'acknowledged' as const;
-          }
-
-          const retainedCleanup = await prisma.documentDataStorageCleanup.findUnique({
-            where: {
-              id: cleanupTask.id,
-            },
-            select: {
-              id: true,
-            },
-          });
-
-          // Another worker may already have acknowledged the same idempotent
-          // DeleteObject. A concurrently extended replay window must remain.
-          return retainedCleanup ? ('early-deleted' as const) : ('acknowledged' as const);
-        }
-
-        await prisma.documentDataStorageCleanup.updateMany({
-          where: {
-            id: cleanupTask.id,
-          },
-          data: {
-            earlyDeleteAttemptedAt: new Date(),
-          },
-        });
-
-        return 'early-deleted' as const;
+        );
       } catch (error) {
         await prisma.documentDataStorageCleanup
           .updateMany({

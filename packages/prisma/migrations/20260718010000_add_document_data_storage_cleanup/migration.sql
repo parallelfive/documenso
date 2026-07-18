@@ -7,12 +7,12 @@ CREATE TABLE "DocumentDataStorageCleanup" (
     "id" TEXT NOT NULL,
     "key" TEXT NOT NULL,
     "documentDataId" TEXT,
-    "notBefore" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "notBefore" TIMESTAMP(3) NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
     "earlyDeleteEnabled" BOOLEAN NOT NULL DEFAULT true,
     "earlyDeleteAttemptedAt" TIMESTAMP(3),
     "attemptCount" INTEGER NOT NULL DEFAULT 0,
     "lastAttemptAt" TIMESTAMP(3),
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
 
     CONSTRAINT "DocumentDataStorageCleanup_pkey" PRIMARY KEY ("id")
 );
@@ -23,8 +23,19 @@ ON "DocumentDataStorageCleanup"("key");
 CREATE INDEX "DocumentDataStorageCleanup_notBefore_createdAt_idx"
 ON "DocumentDataStorageCleanup"("notBefore", "createdAt");
 
-CREATE INDEX "DocumentDataStorageCleanup_documentDataId_idx"
+CREATE UNIQUE INDEX "DocumentDataStorageCleanup_documentDataId_key"
 ON "DocumentDataStorageCleanup"("documentDataId");
+
+-- These must stay partial: BYTES/BYTES_64 rows can contain multi-megabyte PDF
+-- payloads that are not valid btree index entries. Runtime cleanup probes only
+-- S3_PATH keys through these two columns while holding a short key lock.
+CREATE INDEX "DocumentData_s3_path_data_idx"
+ON "DocumentData"("data")
+WHERE "type" = 'S3_PATH'::"DocumentDataType";
+
+CREATE INDEX "DocumentData_s3_path_initialData_idx"
+ON "DocumentData"("initialData")
+WHERE "type" = 'S3_PATH'::"DocumentDataType";
 
 -- Lock both sides of the one-to-one relation for the short backfill. Normal
 -- runtime cleanup uses row guards instead of relying on this migration lock.
@@ -59,7 +70,7 @@ INSERT INTO "DocumentDataStorageCleanup" ("id", "key", "notBefore")
 SELECT
     'legacy_' || md5(key) || md5(reverse(key)),
     key,
-    CURRENT_TIMESTAMP + INTERVAL '65 minutes'
+    (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') + INTERVAL '65 minutes'
 FROM orphan_keys
 ON CONFLICT ("key") DO NOTHING;
 

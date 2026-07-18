@@ -21,6 +21,14 @@ import { signPdf } from '@documenso/signing';
 
 import { NEXT_PRIVATE_USE_PLAYWRIGHT_PDF } from '../../../constants/app';
 import { AppError, AppErrorCode } from '../../../errors/app-error';
+import {
+  processDocumentDataStorageCleanup,
+  processDocumentDataStorageCleanupAfterCommit,
+} from '../../../server-only/document-data/process-document-data-storage-cleanup';
+import {
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+  stageDocumentDataStorageCleanup,
+} from '../../../server-only/document-data/stage-document-data-storage-cleanup';
 import { sendCompletedEmail } from '../../../server-only/document/send-completed-email';
 import { getAuditLogsPdf } from '../../../server-only/htmltopdf/get-audit-logs-pdf';
 import { getCertificatePdf } from '../../../server-only/htmltopdf/get-certificate-pdf';
@@ -36,13 +44,18 @@ import {
 import { mapEnvelopeToWebhookDocumentPayload } from '../../../types/webhook-payload';
 import { prefixedId } from '../../../universal/id';
 import { getFileServerSide } from '../../../universal/upload/get-file.server';
-import { putPdfFileServerSide } from '../../../universal/upload/put-file.server';
+import { putInternalPdfSnapshotServerSide } from '../../../universal/upload/put-file.server';
 import { fieldsContainUnsignedRequiredField } from '../../../utils/advanced-fields-helpers';
 import { isDocumentCompleted } from '../../../utils/document';
 import { createDocumentAuditLogData } from '../../../utils/document-audit-logs';
 import { mapDocumentIdToSecondaryId } from '../../../utils/envelope';
+import { logger } from '../../../utils/logger';
 import type { JobRunIO } from '../../client/_internal/job';
 import type { TSealDocumentJobDefinition } from './seal-document';
+import {
+  type PreparedSealDocumentData,
+  commitPreparedSealDocumentData,
+} from './seal-document-storage';
 
 export const run = async ({
   payload,
@@ -120,6 +133,17 @@ export const run = async ({
     }
 
     let { envelopeItems } = envelope;
+    const persistedDocumentDataByEnvelopeItemId = new Map(
+      envelope.envelopeItems.map((envelopeItem) => [
+        envelopeItem.id,
+        {
+          id: envelopeItem.documentData.id,
+          type: envelopeItem.documentData.type,
+          data: envelopeItem.documentData.data,
+          initialData: envelopeItem.documentData.initialData,
+        },
+      ]),
+    );
 
     const fields = envelope.fields;
 
@@ -198,115 +222,147 @@ export const run = async ({
     const needsCertificate = settings.includeSigningCertificate;
     const needsAuditLog = settings.includeAuditLog;
 
-    const newDocumentData: Array<{ oldDocumentDataId: string; newDocumentDataId: string }> = [];
+    const preparedDocumentData: PreparedSealDocumentData[] = [];
+    let retiredSourceCleanupIds: string[] = [];
 
-    for (const { envelopeItem, pdfData } of prefetchedItems) {
-      const envelopeItemFields = envelope.envelopeItems.find(
-        (item) => item.id === envelopeItem.id,
-      )?.field;
+    try {
+      for (const { envelopeItem, pdfData } of prefetchedItems) {
+        const envelopeItemFields = envelope.envelopeItems.find(
+          (item) => item.id === envelopeItem.id,
+        )?.field;
 
-      if (!envelopeItemFields) {
-        throw new Error(`Envelope item fields not found for envelope item ${envelopeItem.id}`);
-      }
+        if (!envelopeItemFields) {
+          throw new Error(`Envelope item fields not found for envelope item ${envelopeItem.id}`);
+        }
 
-      let certificateDoc: PDF | null = null;
-      let auditLogDoc: PDF | null = null;
+        let certificateDoc: PDF | null = null;
+        let auditLogDoc: PDF | null = null;
 
-      if (needsCertificate || needsAuditLog) {
-        const pdfDoc = await PDF.load(pdfData);
+        if (needsCertificate || needsAuditLog) {
+          const pdfDoc = await PDF.load(pdfData);
 
-        const { width: pageWidth, height: pageHeight } = getLastPageDimensions(pdfDoc);
+          const { width: pageWidth, height: pageHeight } = getLastPageDimensions(pdfDoc);
 
-        const additionalAuditLogs = [
-          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
-          {
-            ...envelopeCompletedAuditLog,
-            id: '',
-            createdAt: new Date(),
-          } as TDocumentAuditLog,
-        ];
+          const additionalAuditLogs = [
+            // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+            {
+              ...envelopeCompletedAuditLog,
+              id: '',
+              createdAt: new Date(),
+            } as TDocumentAuditLog,
+          ];
 
-        const certificatePayload = {
-          envelope: {
-            ...envelope,
-            status: finalEnvelopeStatus,
-          },
-          recipients: envelope.recipients,
-          fields,
-          language: envelope.documentMeta.language,
-          envelopeOwner: {
-            email: envelope.user.email,
-            name: envelope.user.name || '',
-          },
-          envelopeItems: envelopeItems.map((item) => item.title),
-          pageWidth,
-          pageHeight,
-          additionalAuditLogs,
-        };
+          const certificatePayload = {
+            envelope: {
+              ...envelope,
+              status: finalEnvelopeStatus,
+            },
+            recipients: envelope.recipients,
+            fields,
+            language: envelope.documentMeta.language,
+            envelopeOwner: {
+              email: envelope.user.email,
+              name: envelope.user.name || '',
+            },
+            envelopeItems: envelopeItems.map((item) => item.title),
+            pageWidth,
+            pageHeight,
+            additionalAuditLogs,
+          };
 
-        const makeCertificatePdf = async () =>
-          usePlaywrightPdf
-            ? getCertificatePdf({
-                documentId,
-                language: envelope.documentMeta.language,
-              }).then(async (buffer) => PDF.load(buffer))
-            : generateCertificatePdf(certificatePayload);
+          const makeCertificatePdf = async () =>
+            usePlaywrightPdf
+              ? getCertificatePdf({
+                  documentId,
+                  language: envelope.documentMeta.language,
+                }).then(async (buffer) => PDF.load(buffer))
+              : generateCertificatePdf(certificatePayload);
 
-        const makeAuditLogPdf = async () =>
-          usePlaywrightPdf
-            ? getAuditLogsPdf({
-                documentId,
-                language: envelope.documentMeta.language,
-              }).then(async (buffer) => PDF.load(buffer))
-            : generateAuditLogPdf(certificatePayload);
+          const makeAuditLogPdf = async () =>
+            usePlaywrightPdf
+              ? getAuditLogsPdf({
+                  documentId,
+                  language: envelope.documentMeta.language,
+                }).then(async (buffer) => PDF.load(buffer))
+              : generateAuditLogPdf(certificatePayload);
 
-        [certificateDoc, auditLogDoc] = await Promise.all([
-          needsCertificate ? makeCertificatePdf() : null,
-          needsAuditLog ? makeAuditLogPdf() : null,
-        ]);
-      }
+          [certificateDoc, auditLogDoc] = await Promise.all([
+            needsCertificate ? makeCertificatePdf() : null,
+            needsAuditLog ? makeAuditLogPdf() : null,
+          ]);
+        }
 
-      const result = await decorateAndSignPdf({
-        envelope,
-        envelopeItem,
-        envelopeItemFields,
-        isRejected,
-        rejectionReason,
-        pdfData,
-        certificateDoc,
-        auditLogDoc,
-      });
+        const result = await decorateAndSignPdf({
+          envelope,
+          envelopeItem,
+          envelopeItemFields,
+          isRejected,
+          rejectionReason,
+          pdfData,
+          certificateDoc,
+          auditLogDoc,
+        });
 
-      newDocumentData.push(result);
-    }
+        const persistedDocumentData = persistedDocumentDataByEnvelopeItemId.get(envelopeItem.id);
 
-    await prisma.$transaction(async (tx) => {
-      for (const { oldDocumentDataId, newDocumentDataId } of newDocumentData) {
-        await tx.envelopeItem.update({
-          where: {
-            envelopeId: envelope.id,
-            documentDataId: oldDocumentDataId,
-          },
-          data: {
-            documentDataId: newDocumentDataId,
-          },
+        if (!persistedDocumentData) {
+          throw new Error(`Persisted document data not found for envelope item ${envelopeItem.id}`);
+        }
+
+        preparedDocumentData.push({
+          envelopeItemId: envelopeItem.id,
+          oldDocumentData: persistedDocumentData,
+          newDocumentData: result.newDocumentData,
         });
       }
 
-      await tx.envelope.update({
-        where: {
+      retiredSourceCleanupIds = await commitPreparedSealDocumentData({
+        envelope: {
           id: envelope.id,
+          status: envelope.status,
         },
-        data: {
-          status: finalEnvelopeStatus,
-          completedAt: new Date(),
-        },
+        finalEnvelopeStatus,
+        preparedDocumentData,
+        envelopeCompletedAuditLog,
       });
 
-      await tx.documentAuditLog.create({
-        data: envelopeCompletedAuditLog,
+      await processDocumentDataStorageCleanupAfterCommit({
+        cleanupIds: retiredSourceCleanupIds,
+        envelopeId: envelope.id,
+        event: 'document-source-retired',
       });
-    });
+    } catch (error) {
+      if (preparedDocumentData.length > 0) {
+        try {
+          const cleanupIds = await prisma.$transaction(
+            async (tx) =>
+              await stageDocumentDataStorageCleanup({
+                tx,
+                documentDataIds: preparedDocumentData.map(
+                  ({ newDocumentData }) => newDocumentData.id,
+                ),
+                preserveExistingNotBefore: false,
+              }),
+            {
+              timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+            },
+          );
+
+          await processDocumentDataStorageCleanup({
+            cleanupIds,
+            limit: cleanupIds.length,
+          });
+        } catch (cleanupError) {
+          logger.warn({
+            event: 'seal-document-preparation-cleanup-failed',
+            preparedDocumentDataCount: preparedDocumentData.length,
+            errorName: cleanupError instanceof Error ? cleanupError.name : 'UnknownError',
+          });
+        }
+      }
+
+      throw error;
+    }
 
     return {
       envelopeId: envelope.id,
@@ -488,17 +544,13 @@ const decorateAndSignPdf = async ({
   // Add suffix based on document status
   const suffix = isRejected ? '_rejected.pdf' : '_signed.pdf';
 
-  const { documentData: newDocumentData } = await putPdfFileServerSide(
-    {
-      name: `${name}${suffix}`,
-      type: 'application/pdf',
-      arrayBuffer: async () => Promise.resolve(pdfBytes),
-    },
-    envelopeItem.documentData.initialData,
-  );
+  const { documentData: newDocumentData } = await putInternalPdfSnapshotServerSide({
+    name: `${name}${suffix}`,
+    type: 'application/pdf',
+    arrayBuffer: async () => Promise.resolve(pdfBytes),
+  });
 
   return {
-    oldDocumentDataId: envelopeItem.documentData.id,
-    newDocumentDataId: newDocumentData.id,
+    newDocumentData,
   };
 };

@@ -1,4 +1,3 @@
-import { DocumentDataType } from '@prisma/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -7,20 +6,21 @@ import {
 } from './process-document-data-storage-cleanup';
 
 const mocks = vi.hoisted(() => ({
+  transaction: vi.fn(),
+  queryRaw: vi.fn(),
   cleanupFindMany: vi.fn(),
   cleanupFindUnique: vi.fn(),
   cleanupDeleteMany: vi.fn(),
   cleanupUpdateMany: vi.fn(),
-  documentDataFindFirst: vi.fn(),
+  documentDataFindUnique: vi.fn(),
+  documentDataDeleteMany: vi.fn(),
   deleteS3File: vi.fn(),
   loggerError: vi.fn(),
 }));
 
 vi.mock('@documenso/prisma', () => ({
   prisma: {
-    documentData: {
-      findFirst: mocks.documentDataFindFirst,
-    },
+    $transaction: mocks.transaction,
     documentDataStorageCleanup: {
       findMany: mocks.cleanupFindMany,
       findUnique: mocks.cleanupFindUnique,
@@ -45,11 +45,31 @@ describe('processDocumentDataStorageCleanup', () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2030-01-01T00:00:00.000Z'));
-    mocks.documentDataFindFirst.mockResolvedValue(null);
+    mocks.documentDataFindUnique.mockResolvedValue(null);
+    mocks.documentDataDeleteMany.mockResolvedValue({ count: 1 });
     mocks.deleteS3File.mockResolvedValue(undefined);
     mocks.cleanupDeleteMany.mockResolvedValue({ count: 1 });
-    mocks.cleanupFindUnique.mockResolvedValue(null);
     mocks.cleanupUpdateMany.mockResolvedValue({ count: 1 });
+    mocks.queryRaw.mockImplementation((query: TemplateStringsArray) =>
+      query.join('').includes(`WHERE "type" = 'S3_PATH'::"DocumentDataType"`)
+        ? []
+        : [{}],
+    );
+    mocks.transaction.mockImplementation(
+      async (callback: (tx: unknown) => Promise<unknown>) =>
+        await callback({
+          $queryRaw: mocks.queryRaw,
+          documentData: {
+            findUnique: mocks.documentDataFindUnique,
+            deleteMany: mocks.documentDataDeleteMany,
+          },
+          documentDataStorageCleanup: {
+            findUnique: mocks.cleanupFindUnique,
+            deleteMany: mocks.cleanupDeleteMany,
+            updateMany: mocks.cleanupUpdateMany,
+          },
+        }),
+    );
   });
 
   afterEach(() => {
@@ -57,14 +77,21 @@ describe('processDocumentDataStorageCleanup', () => {
   });
 
   it('acknowledges a due task only after its object delete succeeds', async () => {
+    const notBefore = new Date('2029-12-31T23:59:59.000Z');
     mocks.cleanupFindMany.mockResolvedValue([
       {
         id: 'cleanup-due',
         key: 'private/due.pdf',
-        notBefore: new Date('2029-12-31T23:59:59.000Z'),
+        notBefore,
         attemptCount: 0,
       },
     ]);
+    mocks.cleanupFindUnique.mockResolvedValue({
+      id: 'cleanup-due',
+      key: 'private/due.pdf',
+      notBefore,
+      documentDataId: null,
+    });
 
     await expect(processDocumentDataStorageCleanup()).resolves.toEqual({
       selectedCount: 1,
@@ -75,15 +102,11 @@ describe('processDocumentDataStorageCleanup', () => {
       failedCount: 0,
     });
 
-    expect(mocks.documentDataFindFirst).toHaveBeenCalledWith({
-      where: {
-        type: DocumentDataType.S3_PATH,
-        OR: [{ data: 'private/due.pdf' }, { initialData: 'private/due.pdf' }],
-      },
-      select: {
-        id: true,
-      },
-    });
+    expect(
+      mocks.queryRaw.mock.calls.filter(([query]: [TemplateStringsArray]) =>
+        query.join('').includes(`WHERE "type" = 'S3_PATH'::"DocumentDataType"`),
+      ),
+    ).toHaveLength(1);
     expect(mocks.deleteS3File).toHaveBeenCalledWith('private/due.pdf', {
       requestTimeoutMs: DOCUMENT_DATA_STORAGE_DELETE_TIMEOUT_MS,
     });
@@ -98,6 +121,7 @@ describe('processDocumentDataStorageCleanup', () => {
   });
 
   it('early-deletes a replayable key, retains its task, then deletes a replay after expiry', async () => {
+    const notBefore = new Date('2030-01-01T01:05:00.000Z');
     const objects = new Set(['private/replayable.pdf']);
     mocks.deleteS3File.mockImplementation(async (key: string) => {
       await Promise.resolve();
@@ -108,7 +132,7 @@ describe('processDocumentDataStorageCleanup', () => {
         {
           id: 'cleanup-replayable',
           key: 'private/replayable.pdf',
-          notBefore: new Date('2030-01-01T01:05:00.000Z'),
+          notBefore,
           attemptCount: 0,
         },
       ])
@@ -116,10 +140,16 @@ describe('processDocumentDataStorageCleanup', () => {
         {
           id: 'cleanup-replayable',
           key: 'private/replayable.pdf',
-          notBefore: new Date('2030-01-01T01:05:00.000Z'),
+          notBefore,
           attemptCount: 0,
         },
       ]);
+    mocks.cleanupFindUnique.mockResolvedValue({
+      id: 'cleanup-replayable',
+      key: 'private/replayable.pdf',
+      notBefore,
+      documentDataId: null,
+    });
 
     await expect(
       processDocumentDataStorageCleanup({
@@ -135,6 +165,9 @@ describe('processDocumentDataStorageCleanup', () => {
     expect(mocks.cleanupUpdateMany).toHaveBeenCalledWith({
       where: {
         id: 'cleanup-replayable',
+        notBefore: {
+          lte: notBefore,
+        },
       },
       data: {
         earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
@@ -162,14 +195,21 @@ describe('processDocumentDataStorageCleanup', () => {
   });
 
   it('retains a failed task for retry and never logs its storage key', async () => {
+    const notBefore = new Date('2029-12-31T23:59:59.000Z');
     mocks.cleanupFindMany.mockResolvedValue([
       {
         id: 'cleanup-failed',
         key: 'private/never-log-this.pdf',
-        notBefore: new Date('2029-12-31T23:59:59.000Z'),
+        notBefore,
         attemptCount: 2,
       },
     ]);
+    mocks.cleanupFindUnique.mockResolvedValue({
+      id: 'cleanup-failed',
+      key: 'private/never-log-this.pdf',
+      notBefore,
+      documentDataId: null,
+    });
     mocks.deleteS3File.mockRejectedValue(new Error('object store unavailable'));
 
     await expect(processDocumentDataStorageCleanup()).resolves.toEqual({
@@ -208,7 +248,17 @@ describe('processDocumentDataStorageCleanup', () => {
         attemptCount: 0,
       },
     ]);
-    mocks.documentDataFindFirst.mockResolvedValue({ id: 'live-data' });
+    mocks.cleanupFindUnique.mockResolvedValue({
+      id: 'cleanup-shared',
+      key: 'private/shared.pdf',
+      notBefore: originalNotBefore,
+      documentDataId: null,
+    });
+    mocks.queryRaw.mockImplementation((query: TemplateStringsArray) =>
+      query.join('').includes(`WHERE "type" = 'S3_PATH'::"DocumentDataType"`)
+        ? [{ data: 'private/shared.pdf', initialData: 'private/shared.pdf' }]
+        : [{}],
+    );
 
     await expect(processDocumentDataStorageCleanup()).resolves.toEqual({
       selectedCount: 1,
@@ -220,17 +270,6 @@ describe('processDocumentDataStorageCleanup', () => {
     });
 
     expect(mocks.deleteS3File).not.toHaveBeenCalled();
-    expect(mocks.cleanupUpdateMany).toHaveBeenCalledWith({
-      where: {
-        id: 'cleanup-shared',
-        notBefore: {
-          lt: originalNotBefore,
-        },
-      },
-      data: {
-        notBefore: originalNotBefore,
-      },
-    });
     expect(mocks.cleanupUpdateMany).toHaveBeenCalledWith({
       where: {
         id: 'cleanup-shared',
@@ -239,63 +278,28 @@ describe('processDocumentDataStorageCleanup', () => {
         },
       },
       data: {
+        notBefore: originalNotBefore,
         earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
       },
     });
   });
 
-  it('keeps a concurrently extended live-reference generation early-eligible', async () => {
-    const selectedNotBefore = new Date('2030-01-01T00:01:00.000Z');
-    const referencedTaskNotBefore = new Date('2030-01-01T00:15:00.000Z');
+  it('guards a no-live early marker with the current task generation cutoff', async () => {
+    const selectedNotBefore = new Date('2030-01-01T01:05:00.000Z');
     mocks.cleanupFindMany.mockResolvedValue([
       {
-        id: 'cleanup-live-reference-extended',
-        key: 'private/live-reference-extended.pdf',
+        id: 'cleanup-no-live-generation',
+        key: 'private/no-live-generation.pdf',
         notBefore: selectedNotBefore,
         attemptCount: 0,
       },
     ]);
-    mocks.documentDataFindFirst.mockResolvedValue({ id: 'live-data' });
-    mocks.cleanupUpdateMany
-      .mockResolvedValueOnce({ count: 1 })
-      // A concurrent stage extended notBefore beyond this worker's generation.
-      .mockResolvedValueOnce({ count: 0 });
-
-    await expect(processDocumentDataStorageCleanup()).resolves.toEqual({
-      selectedCount: 1,
-      objectDeleteCount: 0,
-      acknowledgedCount: 0,
-      cancelledCount: 0,
-      deferredCount: 1,
-      failedCount: 0,
+    mocks.cleanupFindUnique.mockResolvedValue({
+      id: 'cleanup-no-live-generation',
+      key: 'private/no-live-generation.pdf',
+      notBefore: selectedNotBefore,
+      documentDataId: null,
     });
-
-    expect(mocks.cleanupUpdateMany).toHaveBeenNthCalledWith(2, {
-      where: {
-        id: 'cleanup-live-reference-extended',
-        notBefore: {
-          lte: referencedTaskNotBefore,
-        },
-      },
-      data: {
-        earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
-      },
-    });
-    expect(mocks.deleteS3File).not.toHaveBeenCalled();
-  });
-
-  it('retains a task whose replay cutoff was concurrently extended after selection', async () => {
-    const selectedNotBefore = new Date('2029-12-31T23:59:59.000Z');
-    mocks.cleanupFindMany.mockResolvedValue([
-      {
-        id: 'cleanup-extended',
-        key: 'private/extended.pdf',
-        notBefore: selectedNotBefore,
-        attemptCount: 0,
-      },
-    ]);
-    mocks.cleanupDeleteMany.mockResolvedValue({ count: 0 });
-    mocks.cleanupFindUnique.mockResolvedValue({ id: 'cleanup-extended' });
 
     await expect(processDocumentDataStorageCleanup()).resolves.toEqual({
       selectedCount: 1,
@@ -306,20 +310,56 @@ describe('processDocumentDataStorageCleanup', () => {
       failedCount: 0,
     });
 
-    expect(mocks.cleanupDeleteMany).toHaveBeenCalledWith({
+    expect(mocks.cleanupUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'cleanup-no-live-generation',
+        notBefore: {
+          lte: selectedNotBefore,
+        },
+      },
+      data: {
+        earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
+      },
+    });
+  });
+
+  it('rereads and preserves a task whose cutoff was extended after selection', async () => {
+    const selectedNotBefore = new Date('2029-12-31T23:59:59.000Z');
+    const currentNotBefore = new Date('2030-01-01T01:05:00.000Z');
+    mocks.cleanupFindMany.mockResolvedValue([
+      {
+        id: 'cleanup-extended',
+        key: 'private/extended.pdf',
+        notBefore: selectedNotBefore,
+        attemptCount: 0,
+      },
+    ]);
+    mocks.cleanupFindUnique.mockResolvedValue({
+      id: 'cleanup-extended',
+      key: 'private/extended.pdf',
+      notBefore: currentNotBefore,
+      documentDataId: null,
+    });
+
+    await expect(processDocumentDataStorageCleanup()).resolves.toEqual({
+      selectedCount: 1,
+      objectDeleteCount: 1,
+      acknowledgedCount: 0,
+      cancelledCount: 0,
+      deferredCount: 0,
+      failedCount: 0,
+    });
+
+    expect(mocks.cleanupDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.cleanupUpdateMany).toHaveBeenCalledWith({
       where: {
         id: 'cleanup-extended',
         notBefore: {
-          lte: new Date('2030-01-01T00:00:00.000Z'),
+          lte: currentNotBefore,
         },
       },
-    });
-    expect(mocks.cleanupFindUnique).toHaveBeenCalledWith({
-      where: {
-        id: 'cleanup-extended',
-      },
-      select: {
-        id: true,
+      data: {
+        earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
       },
     });
   });

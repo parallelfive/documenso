@@ -117,10 +117,10 @@ export const uploadS3File = async (
   const { name, ext } = path.parse(file.name);
 
   const key = `${alphaid(12)}/${slugify(name)}${ext}`;
+  const uploadStartedAt = Date.now();
 
   await options.onKeyAllocated?.(key);
 
-  const uploadStartedAt = Date.now();
   const fileBuffer = await file.arrayBuffer();
   const remainingTimeoutMs = options.requestTimeoutMs
     ? options.requestTimeoutMs - (Date.now() - uploadStartedAt)

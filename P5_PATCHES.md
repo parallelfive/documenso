@@ -487,8 +487,11 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   items, repeats the legal-state delete predicate, then in the same transaction
   stages every unique S3 key, deletes every now-unreferenced `DocumentData`
   row, and commits the cancellation. Atomic send stages the detached source in
-  the snapshot-attach transaction. Database-backed `BYTES`/`BYTES_64` content
-  is deleted with its row and is never copied into the key-only outbox.
+  the snapshot-attach transaction. Duplicate/save-as-template locks and
+  revalidates every source row before creating its target graph, so
+  cancellation cannot leave a partial copy or an untracked shared reference.
+  Database-backed `BYTES`/`BYTES_64` content is deleted with its row and is
+  never copied into the key-only outbox.
 - **Crash-safe internal snapshots:** the internal-only upload allocates its
   random key, durably reserves a non-early cleanup intent, and only then starts
   `PutObject`. Snapshot metadata creation atomically binds that intent.
@@ -498,19 +501,34 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   the sweeper retires only a still-unattached provisional row. The internal
   upload has a five-minute end-to-end post-reservation deadline, safely inside
   the 15-minute attach grace; a hung upload aborts while its intent remains.
+  That deadline starts before the reservation callback, so database/key-lock
+  delay cannot silently consume the grace period outside the budget.
   Generic/native server uploads retain their existing request behavior.
+- **Crash-safe sealing:** seal/reseal uploads each finished PDF through the
+  same pre-Put provisional protocol. Its commit locks the envelope, then every
+  old/new storage key in one global order; validates the entire old/new batch
+  before its first mutation; releases each provisional intent; swaps every
+  item; and stages every retired source in one transaction. A loser cleans its
+  prepared rows without touching installed data, while process death leaves
+  durable intents for the sweeper.
 - **Replay-safe deletion:** client upload presigns remain valid for one hour.
   Source/cancellation tasks perform an immediate idempotent `DeleteObject` but
   retain their intent for 65 minutes, then perform a mandatory final delete.
   A replay after the early delete cannot resurrect retained bytes. Concurrent
   extensions use guarded predicates and can never shorten or lose the later
   final-delete obligation.
-- **Reference and race safety:** every physical delete rechecks both
-  `DocumentData.data` and `initialData`. Shared keys are deferred, attached
-  provisional snapshots cancel stale intents, item/status transitions are
-  row-locked, and outbox acknowledgement repeats the selected `notBefore`
-  predicate. DeleteObject is idempotent, so worker/acknowledgement races safely
-  repeat. No key or PDF content is emitted to logs.
+- **Reference and race safety:** every metadata transition and physical delete
+  for an S3 key takes a client-hashed PostgreSQL advisory transaction lock.
+  Complete key sets are deduplicated and acquired in signed-ID order, so the
+  last two shared references, attachment, send, seal, cancellation, and worker
+  acknowledgement linearize without exposing keys in lock diagnostics.
+  Outbox updates replace the current key generation atomically and reset stale
+  early-delete markers. Every physical delete rechecks both
+  `DocumentData.data` and `initialData`; shared keys are deferred, attached
+  provisional snapshots cancel stale intents, and acknowledgement/marker
+  updates repeat the selected generation cutoff. DeleteObject is idempotent,
+  so worker/acknowledgement races safely repeat. No key or PDF content is
+  emitted to logs.
 - **Durable retry:** cleanup runs synchronously after commit for prompt
   retirement but never turns a committed send/cancellation into a false
   rollback. Failed tasks retain attempt metadata and a bounded,
@@ -519,7 +537,15 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   hanging a committed API response or worker slot. The release migration, run
   while the provider is quiesced, backfills unique existing orphan S3 keys with
   the same replay window, skips keys still referenced by either column, and
-  removes orphan database content.
+  removes orphan database content. Its timestamp-without-time-zone defaults and
+  65-minute cutoff write an explicit UTC wall clock, independent of the
+  provider migration session timezone.
+- **Reference-query scale:** the migration adds S3-only partial indexes for
+  both storage-key columns; database-backed PDF payloads are never indexed.
+  Runtime reference probes use a literal enum predicate plus parameterized
+  `UNION ALL` branches, allowing PostgreSQL generic prepared plans to use both
+  partial indexes with index conditions instead of scanning/filtering one
+  entire S3 index.
 - **Files:**
   - `packages/prisma/schema.prisma` and
     `20260718010000_add_document_data_storage_cleanup` — durable key-only
@@ -529,15 +555,24 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
     reference-safe DeleteObject, and guarded acknowledgement.
   - `packages/lib/server-only/document/{send-document,delete-document}.ts` —
     source retirement and native/API hard-delete integration.
+  - `packages/lib/server-only/envelope/duplicate-envelope.ts` and
+    `packages/lib/jobs/definitions/internal/seal-document-storage.ts` —
+    atomic shared-key duplication and crash-safe seal attachment/retirement.
   - `packages/lib/universal/upload/{server-actions,put-file.server}.ts` —
     pre-Put key reservation hook and internal snapshot binding.
   - `packages/lib/jobs/definitions/internal/cleanup-document-data-storage*` —
     bounded durable retry sweep.
   - Focused unit tests plus the opt-in PostgreSQL/real AWS SDK loopback test
-    cover migration backfill, no payload copying, source/snapshot success,
-    pre-Put and post-bind process death, replay after early delete, final
-    delete, shared `data`/`initialData`, missing intent rollback, storage
-    failure, and concurrent cutoff/acknowledgement races.
+    cover non-UTC migration backfill, generic-plan partial-index use, no
+    payload copying, source/snapshot/seal success, pre-Put and post-bind process
+    death, replay after early delete, final delete, shared
+    `data`/`initialData`, missing intent rollback, storage failure, both
+    last-reference lock orders, attachment/worker lock orders, and concurrent
+    cutoff/acknowledgement generations.
+- **Scope boundary:** broader consolidation of generic template/document-data
+  creation is a maintainability follow-up. Do not add isolated key locking to
+  those paths without moving the complete reference transition into one
+  transaction; partial ordering would reintroduce deadlock or TOCTOU risk.
 - **Remove when:** upstream transactionally retires unreferenced document data
   and every backing object across native/API lifecycle paths with equivalent
   crash recovery, presign-replay protection, reference guards, bounded durable

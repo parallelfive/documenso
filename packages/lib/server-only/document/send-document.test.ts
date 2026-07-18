@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   getEnvelopeWhereInput: vi.fn(),
   getFileServerSide: vi.fn(),
   putInternalPdfSnapshotServerSide: vi.fn(),
+  lockDocumentDataStorageKeys: vi.fn(),
   stageDocumentDataStorageCleanup: vi.fn(),
   releaseProvisionalDocumentDataStorageCleanup: vi.fn(),
   processDocumentDataStorageCleanupAfterCommit: vi.fn(),
@@ -85,7 +86,9 @@ vi.mock('../document-data/process-document-data-storage-cleanup', () => ({
 }));
 
 vi.mock('../document-data/stage-document-data-storage-cleanup', () => ({
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS: 35_000,
   getDocumentDataPresignReplayNotBefore: () => new Date('2030-01-01T01:05:00.000Z'),
+  lockDocumentDataStorageKeys: mocks.lockDocumentDataStorageKeys,
   releaseProvisionalDocumentDataStorageCleanup:
     mocks.releaseProvisionalDocumentDataStorageCleanup,
   stageDocumentDataStorageCleanup: mocks.stageDocumentDataStorageCleanup,
@@ -440,7 +443,7 @@ describe('sendDocument immutable atomic execution lease', () => {
       }),
     ).rejects.toThrow('Internal snapshot cleanup reservation was not released');
 
-    expect(mocks.envelopeItemUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.envelopeItemUpdateMany).not.toHaveBeenCalled();
     expect(mocks.stageDocumentDataStorageCleanup).toHaveBeenCalledWith({
       tx: expect.any(Object),
       documentDataIds: [snapshotDocumentData.id],
