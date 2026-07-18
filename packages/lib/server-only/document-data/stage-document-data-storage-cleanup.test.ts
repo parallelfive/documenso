@@ -111,6 +111,63 @@ describe('stageDocumentDataStorageCleanup', () => {
     });
   });
 
+  it('deduplicates data/initialData shared keys without shortening the replay cutoff', async () => {
+    const mocks = createTransaction();
+    const replayNotBefore = new Date('2030-01-01T01:05:00.000Z');
+    const documentData = [
+      {
+        id: 'data-current',
+        type: DocumentDataType.S3_PATH,
+        data: 'private/current.pdf',
+        initialData: 'private/shared.pdf',
+      },
+      {
+        id: 'data-shared',
+        type: DocumentDataType.S3_PATH,
+        data: 'private/shared.pdf',
+        initialData: 'private/shared.pdf',
+      },
+    ];
+    mocks.documentDataFindMany
+      .mockResolvedValueOnce(documentData)
+      .mockResolvedValueOnce(documentData);
+    mocks.documentDataDeleteMany.mockResolvedValue({ count: 2 });
+    mocks.cleanupFindUnique.mockResolvedValue(null);
+    mocks.cleanupCreate
+      .mockResolvedValueOnce({ id: 'cleanup-current' })
+      .mockResolvedValueOnce({ id: 'cleanup-shared' });
+
+    await expect(
+      stageDocumentDataStorageCleanup({
+        tx: mocks.tx,
+        documentDataIds: ['data-current', 'data-shared', 'data-current'],
+        notBefore: replayNotBefore,
+      }),
+    ).resolves.toEqual(['cleanup-current', 'cleanup-shared']);
+
+    expect(mocks.cleanupCreate).toHaveBeenCalledTimes(2);
+    expect(mocks.cleanupCreate).toHaveBeenNthCalledWith(1, {
+      data: {
+        key: 'private/current.pdf',
+        notBefore: replayNotBefore,
+        earlyDeleteEnabled: true,
+      },
+      select: {
+        id: true,
+      },
+    });
+    expect(mocks.cleanupCreate).toHaveBeenNthCalledWith(2, {
+      data: {
+        key: 'private/shared.pdf',
+        notBefore: replayNotBefore,
+        earlyDeleteEnabled: true,
+      },
+      select: {
+        id: true,
+      },
+    });
+  });
+
   it('never stages a physical key that another DocumentData row still references', async () => {
     const mocks = createTransaction();
 

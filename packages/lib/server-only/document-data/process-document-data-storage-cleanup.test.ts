@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DOCUMENT_DATA_STORAGE_DELETE_TIMEOUT_MS,
   processDocumentDataStorageCleanup,
+  processDocumentDataStorageCleanupAfterCommit,
 } from './process-document-data-storage-cleanup';
 
 const mocks = vi.hoisted(() => ({
@@ -103,8 +104,10 @@ describe('processDocumentDataStorageCleanup', () => {
     });
 
     expect(
-      mocks.queryRaw.mock.calls.filter(([query]: [TemplateStringsArray]) =>
-        query.join('').includes(`WHERE "type" = 'S3_PATH'::"DocumentDataType"`),
+      mocks.queryRaw.mock.calls.filter(
+        (call) =>
+          Array.isArray(call[0]) &&
+          call[0].join('').includes(`WHERE "type" = 'S3_PATH'::"DocumentDataType"`),
       ),
     ).toHaveLength(1);
     expect(mocks.deleteS3File).toHaveBeenCalledWith('private/due.pdf', {
@@ -361,6 +364,26 @@ describe('processDocumentDataStorageCleanup', () => {
       data: {
         earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
       },
+    });
+  });
+
+  it('keeps a committed admin deletion successful when prompt cleanup dispatch fails', async () => {
+    mocks.cleanupFindMany.mockRejectedValueOnce(new Error('object store unavailable'));
+
+    await expect(
+      processDocumentDataStorageCleanupAfterCommit({
+        cleanupIds: ['cleanup-admin-delete'],
+        envelopeId: 'envelope-completed',
+        event: 'document-admin-deleted',
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.loggerError).toHaveBeenCalledWith({
+      event: 'document-data-storage-cleanup-dispatch-failed',
+      sourceEvent: 'document-admin-deleted',
+      envelopeId: 'envelope-completed',
+      cleanupTaskCount: 1,
+      errorName: 'Error',
     });
   });
 });
