@@ -21,6 +21,7 @@ import { nanoid, prefixedId } from '@documenso/lib/universal/id';
 import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import type {
   TDocumentAccessAuthTypes,
   TDocumentActionAuthTypes,
@@ -30,18 +31,17 @@ import type {
 import type { TDocumentFormValues } from '../../types/document-form-values';
 import type { TEnvelopeAttachmentType } from '../../types/envelope-attachment';
 import type { TFieldAndMeta } from '../../types/field-meta';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import { getFileServerSide } from '../../universal/upload/get-file.server';
 import { putPdfFileServerSide } from '../../universal/upload/put-file.server';
 import { extractDerivedDocumentMeta } from '../../utils/document';
 import { createDocumentAuthOptions, createRecipientAuthOptions } from '../../utils/document-auth';
 import { buildTeamWhereQuery } from '../../utils/teams';
 import { incrementDocumentId, incrementTemplateId } from '../envelope/increment-id';
+import { assertCorrelatedDocumentRecipientPopulationAllowed } from '../recipient/assert-correlated-document-recipient-population';
 import { getTeamSettings } from '../team/get-team-settings';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
+import { assertBizBuddyExternalIdAuthorized } from './assert-bizbuddy-external-id-authorized';
 
 type CreateEnvelopeRecipientFieldOptions = TFieldAndMeta & {
   documentDataId: string;
@@ -107,6 +107,7 @@ export type CreateEnvelopeOptions = {
 
   meta?: Partial<Omit<DocumentMeta, 'id'>>;
   requestMetadata: ApiRequestMetadata;
+  allowReservedBizBuddyExternalId?: boolean;
 };
 
 export const createEnvelope = async ({
@@ -119,6 +120,7 @@ export const createEnvelope = async ({
   requestMetadata,
   internalVersion,
   bypassDefaultRecipients = false,
+  allowReservedBizBuddyExternalId = false,
 }: CreateEnvelopeOptions) => {
   const {
     type,
@@ -135,6 +137,39 @@ export const createEnvelope = async ({
     visibility: visibilityOverride,
     delegatedDocumentOwner,
   } = data;
+
+  assertBizBuddyExternalIdAuthorized({
+    externalId,
+    allowReservedNamespace:
+      allowReservedBizBuddyExternalId && type === EnvelopeType.DOCUMENT && internalVersion === 1,
+  });
+
+  if (type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(externalId)) {
+    if ((attachments?.length ?? 0) > 0) {
+      throw new AppError(AppErrorCode.INVALID_BODY, {
+        message: 'Correlated documents do not support attachments',
+      });
+    }
+
+    if ((globalAccessAuth?.length ?? 0) > 0 || (globalActionAuth?.length ?? 0) > 0) {
+      throw new AppError(AppErrorCode.INVALID_BODY, {
+        message: 'Correlated documents do not support document authentication',
+      });
+    }
+
+    if (formValues !== undefined) {
+      throw new AppError(AppErrorCode.INVALID_BODY, {
+        message: 'Correlated documents do not support form values',
+      });
+    }
+
+    if (data.recipients !== undefined) {
+      assertCorrelatedDocumentRecipientPopulationAllowed({
+        externalId,
+        recipients: data.recipients,
+      });
+    }
+  }
 
   const team = await prisma.team.findFirst({
     where: buildTeamWhereQuery({ teamId, userId }),
@@ -628,14 +663,14 @@ export const createEnvelope = async ({
   if (type === EnvelopeType.DOCUMENT) {
     await triggerWebhook({
       event: WebhookTriggerEvents.DOCUMENT_CREATED,
-      data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(createdEnvelope)),
+      data: () => mapEnvelopeToWebhookDocumentPayload(createdEnvelope),
       userId,
       teamId,
     });
   } else if (type === EnvelopeType.TEMPLATE) {
     await triggerWebhook({
       event: WebhookTriggerEvents.TEMPLATE_CREATED,
-      data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(createdEnvelope)),
+      data: () => mapEnvelopeToWebhookDocumentPayload(createdEnvelope),
       userId,
       teamId,
     });

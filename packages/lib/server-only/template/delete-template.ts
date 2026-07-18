@@ -2,10 +2,7 @@ import { EnvelopeType, WebhookTriggerEvents } from '@prisma/client';
 
 import { prisma } from '@documenso/prisma';
 
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import { type EnvelopeIdOptions } from '../../utils/envelope';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
@@ -35,7 +32,7 @@ export const deleteTemplate = async ({ id, userId, teamId }: DeleteTemplateOptio
 
   await triggerWebhook({
     event: WebhookTriggerEvents.TEMPLATE_DELETED,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(templateToDelete)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(templateToDelete),
     userId,
     teamId,
   });

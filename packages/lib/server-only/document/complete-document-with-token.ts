@@ -25,10 +25,7 @@ import { AppError, AppErrorCode } from '../../errors/app-error';
 import { jobs } from '../../jobs/client';
 import type { TRecipientAccessAuth } from '../../types/document-auth';
 import { DocumentAuth } from '../../types/document-auth';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import { extractDocumentAuthMethods } from '../../utils/document-auth';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
 import { mapSecondaryIdToDocumentId, unsafeBuildEnvelopeIdQuery } from '../../utils/envelope';
@@ -36,6 +33,7 @@ import { assertRecipientNotExpired } from '../../utils/recipients';
 import { getIsRecipientsTurnToSign } from '../recipient/get-is-recipient-turn';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
 import { isRecipientAuthorized } from './is-recipient-authorized';
+import { getNextSignerIdentityOverride } from './next-signer-identity';
 import { sendPendingEmail } from './send-pending-email';
 
 export type CompleteDocumentWithTokenOptions = {
@@ -364,7 +362,7 @@ export const completeDocumentWithToken = async ({
 
   await triggerWebhook({
     event: WebhookTriggerEvents.DOCUMENT_RECIPIENT_COMPLETED,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(envelopeWithRelations)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(envelopeWithRelations),
     userId: envelope.userId,
     teamId: envelope.teamId,
   });
@@ -404,9 +402,14 @@ export const completeDocumentWithToken = async ({
 
     if (envelope.documentMeta?.signingOrder === DocumentSigningOrder.SEQUENTIAL) {
       const [nextRecipient] = pendingRecipients;
+      const nextSignerIdentityOverride = getNextSignerIdentityOverride({
+        externalId: envelope.externalId,
+        allowDictateNextSigner: envelope.documentMeta.allowDictateNextSigner,
+        nextSigner,
+      });
 
       await prisma.$transaction(async (tx) => {
-        if (nextSigner && envelope.documentMeta?.allowDictateNextSigner) {
+        if (nextSignerIdentityOverride) {
           await tx.documentAuditLog.create({
             data: createDocumentAuditLogData({
               type: DOCUMENT_AUDIT_LOG_TYPE.RECIPIENT_UPDATED,
@@ -425,12 +428,12 @@ export const completeDocumentWithToken = async ({
                   {
                     type: RECIPIENT_DIFF_TYPE.NAME,
                     from: nextRecipient.name,
-                    to: nextSigner.name,
+                    to: nextSignerIdentityOverride.name,
                   },
                   {
                     type: RECIPIENT_DIFF_TYPE.EMAIL,
                     from: nextRecipient.email,
-                    to: nextSigner.email,
+                    to: nextSignerIdentityOverride.email,
                   },
                 ],
               },
@@ -443,12 +446,7 @@ export const completeDocumentWithToken = async ({
           data: {
             sendStatus: SendStatus.SENT,
             sentAt: new Date(),
-            ...(nextSigner && envelope.documentMeta?.allowDictateNextSigner
-              ? {
-                  name: nextSigner.name,
-                  email: nextSigner.email,
-                }
-              : {}),
+            ...(nextSignerIdentityOverride ?? {}),
           },
         });
       });
@@ -499,7 +497,7 @@ export const completeDocumentWithToken = async ({
 
   await triggerWebhook({
     event: WebhookTriggerEvents.DOCUMENT_SIGNED,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(updatedDocument)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(updatedDocument),
     userId: updatedDocument.userId,
     teamId: updatedDocument.teamId ?? undefined,
   });

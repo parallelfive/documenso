@@ -6,10 +6,7 @@ import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-
 import { prisma } from '@documenso/prisma';
 
 import type { TDocumentAccessAuthTypes } from '../../types/document-auth';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
 
 export type ViewedDocumentOptions = {
@@ -109,7 +106,7 @@ export const viewedDocument = async ({
 
   await triggerWebhook({
     event: WebhookTriggerEvents.DOCUMENT_OPENED,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(envelope)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(envelope),
     userId: envelope.userId,
     teamId: envelope.teamId,
   });

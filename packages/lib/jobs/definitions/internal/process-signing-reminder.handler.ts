@@ -23,10 +23,7 @@ import { updateRecipientNextReminder } from '../../../server-only/recipient/upda
 import { triggerWebhook } from '../../../server-only/webhooks/trigger/trigger-webhook';
 import { DOCUMENT_AUDIT_LOG_TYPE, DOCUMENT_EMAIL_TYPE } from '../../../types/document-audit-logs';
 import { extractDerivedDocumentEmailSettings } from '../../../types/document-email';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../../types/webhook-payload';
 import { createDocumentAuditLogData } from '../../../utils/document-audit-logs';
 import { renderCustomEmailTemplate } from '../../../utils/render-custom-email-template';
 import { renderEmailWithI18N } from '../../../utils/render-email-with-i18n';
@@ -211,7 +208,7 @@ export const run = async ({
 
   await triggerWebhook({
     event: WebhookTriggerEvents.DOCUMENT_REMINDER_SENT,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(envelope)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(envelope),
     userId: envelope.userId,
     teamId: envelope.teamId,
   });

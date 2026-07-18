@@ -4,6 +4,7 @@ import { AppError, AppErrorCode } from '@documenso/lib/errors/app-error';
 import { prisma } from '@documenso/prisma';
 
 import { buildTeamWhereQuery } from '../../utils/teams';
+import { assertCorrelatedDocumentContentImmutable } from '../envelope/assert-correlated-document-content-immutable';
 
 export type UpdateAttachmentOptions = {
   id: string;
@@ -30,6 +31,8 @@ export const updateAttachment = async ({ id, teamId, userId, data }: UpdateAttac
       message: 'Attachment not found',
     });
   }
+
+  assertCorrelatedDocumentContentImmutable(attachment.envelope);
 
   if (
     attachment.envelope.status === DocumentStatus.COMPLETED ||

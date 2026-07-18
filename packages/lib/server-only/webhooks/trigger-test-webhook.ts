@@ -1,8 +1,9 @@
 import type { WebhookTriggerEvents } from '@prisma/client';
 
+import { projectWebhookLifecycleDocument } from '../../types/webhook-payload';
 import { getWebhookById } from './get-webhook-by-id';
+import { enqueueWebhookDelivery } from './trigger/enqueue-webhook-delivery';
 import { generateSampleWebhookPayload } from './trigger/generate-sample-data';
-import { triggerWebhook } from './trigger/trigger-webhook';
 
 export type TriggerTestWebhookOptions = {
   id: string;
@@ -30,11 +31,12 @@ export const triggerTestWebhook = async ({
   const samplePayload = generateSampleWebhookPayload(event, webhook.webhookUrl);
 
   try {
-    await triggerWebhook({
+    const data = projectWebhookLifecycleDocument(samplePayload.payload);
+
+    await enqueueWebhookDelivery({
       event,
-      data: samplePayload.payload,
-      userId,
-      teamId,
+      webhookId: webhook.id,
+      data,
     });
 
     return { success: true, message: 'Test webhook triggered successfully' };

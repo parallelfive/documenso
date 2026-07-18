@@ -3,6 +3,7 @@ import {
   type DocumentSigningOrder,
   EnvelopeType,
 } from '@prisma/client';
+import { isDeepEqual } from 'remeda';
 
 import { DOCUMENT_AUDIT_LOG_TYPE } from '@documenso/lib/types/document-audit-logs';
 import type { ApiRequestMetadata } from '@documenso/lib/universal/extract-request-metadata';
@@ -12,6 +13,7 @@ import {
 } from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import type { SupportedLanguageCodes } from '../../constants/i18n';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import type { TDocumentEmailSettings } from '../../types/document-email';
@@ -82,6 +84,40 @@ export const updateDocumentMeta = async ({
   }
 
   const { documentMeta: originalDocumentMeta } = envelope;
+  const isCorrelatedDocument =
+    envelope.type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(envelope.externalId);
+
+  if (isCorrelatedDocument) {
+    const requestedMeta = {
+      subject,
+      message,
+      timezone,
+      dateFormat,
+      redirectUrl,
+      signingOrder,
+      allowDictateNextSigner,
+      emailId,
+      emailReplyTo,
+      emailSettings,
+      distributionMethod,
+      typedSignatureEnabled,
+      uploadSignatureEnabled,
+      drawSignatureEnabled,
+      language,
+    };
+    const definedMeta = Object.fromEntries(
+      Object.entries(requestedMeta).filter(([, value]) => value !== undefined),
+    );
+    const currentMeta = originalDocumentMeta ?? {};
+
+    if (!isDeepEqual({ ...currentMeta, ...definedMeta }, currentMeta)) {
+      throw new AppError(AppErrorCode.CONFLICT, {
+        message: 'Correlated document execution metadata is immutable',
+      });
+    }
+
+    return originalDocumentMeta;
+  }
 
   // Validate the emailId belongs to the organisation.
   if (emailId) {
@@ -100,45 +136,49 @@ export const updateDocumentMeta = async ({
   }
 
   return await prisma.$transaction(async (tx) => {
-    const upsertedDocumentMeta = await tx.documentMeta.update({
-      where: {
-        id: envelope.documentMetaId,
-      },
-      data: {
-        subject,
-        message,
-        dateFormat,
-        timezone,
-        redirectUrl,
-        signingOrder,
-        allowDictateNextSigner,
-        emailId,
-        emailReplyTo,
-        emailSettings,
-        distributionMethod,
-        typedSignatureEnabled,
-        uploadSignatureEnabled,
-        drawSignatureEnabled,
-        language,
-      },
-    });
-
-    const changes = diffDocumentMetaChanges(originalDocumentMeta ?? {}, upsertedDocumentMeta);
-
-    // Create audit logs only for document type envelopes.
-    if (changes.length > 0 && envelope.type === EnvelopeType.DOCUMENT) {
-      await tx.documentAuditLog.create({
-        data: createDocumentAuditLogData({
-          type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
-          envelopeId: envelope.id,
-          metadata: requestMetadata,
-          data: {
-            changes: diffDocumentMetaChanges(originalDocumentMeta ?? {}, upsertedDocumentMeta),
-          },
-        }),
+    const updateMeta = async () => {
+      const upsertedDocumentMeta = await tx.documentMeta.update({
+        where: {
+          id: envelope.documentMetaId,
+        },
+        data: {
+          subject,
+          message,
+          dateFormat,
+          timezone,
+          redirectUrl,
+          signingOrder,
+          allowDictateNextSigner,
+          emailId,
+          emailReplyTo,
+          emailSettings,
+          distributionMethod,
+          typedSignatureEnabled,
+          uploadSignatureEnabled,
+          drawSignatureEnabled,
+          language,
+        },
       });
-    }
 
-    return upsertedDocumentMeta;
+      const changes = diffDocumentMetaChanges(originalDocumentMeta ?? {}, upsertedDocumentMeta);
+
+      // Create audit logs only for document type envelopes.
+      if (changes.length > 0 && envelope.type === EnvelopeType.DOCUMENT) {
+        await tx.documentAuditLog.create({
+          data: createDocumentAuditLogData({
+            type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
+            envelopeId: envelope.id,
+            metadata: requestMetadata,
+            data: {
+              changes: diffDocumentMetaChanges(originalDocumentMeta ?? {}, upsertedDocumentMeta),
+            },
+          }),
+        });
+      }
+
+      return upsertedDocumentMeta;
+    };
+
+    return updateMeta();
   });
 };

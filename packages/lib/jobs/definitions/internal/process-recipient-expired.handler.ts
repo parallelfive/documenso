@@ -4,10 +4,7 @@ import { prisma } from '@documenso/prisma';
 
 import { triggerWebhook } from '../../../server-only/webhooks/trigger/trigger-webhook';
 import { DOCUMENT_AUDIT_LOG_TYPE } from '../../../types/document-audit-logs';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../../types/webhook-payload';
 import { createDocumentAuditLogData } from '../../../utils/document-audit-logs';
 import { jobs } from '../../client';
 import type { JobRunIO } from '../../client/_internal/job';
@@ -79,7 +76,7 @@ export const run = async ({
   // Trigger webhook for recipient expiration.
   await triggerWebhook({
     event: WebhookTriggerEvents.RECIPIENT_EXPIRED,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(envelope)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(envelope),
     userId: envelope.userId,
     teamId: envelope.teamId,
   });

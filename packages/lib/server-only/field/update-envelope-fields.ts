@@ -1,4 +1,4 @@
-import { EnvelopeType, type FieldType } from '@prisma/client';
+import { DocumentStatus, EnvelopeType, type FieldType } from '@prisma/client';
 
 import { DOCUMENT_AUDIT_LOG_TYPE } from '@documenso/lib/types/document-audit-logs';
 import type { TFieldMetaSchema } from '@documenso/lib/types/field-meta';
@@ -9,10 +9,12 @@ import {
 } from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { type EnvelopeIdOptions } from '../../utils/envelope';
 import { mapFieldToLegacyField } from '../../utils/fields';
 import { canRecipientFieldsBeModified } from '../../utils/recipients';
+import { withDocumentDraftMutationGuard } from '../document/with-document-draft-mutation-guard';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 
 export interface UpdateEnvelopeFieldsOptions {
@@ -32,6 +34,7 @@ export interface UpdateEnvelopeFieldsOptions {
     fieldMeta?: TFieldMetaSchema;
   }[];
   requestMetadata: ApiRequestMetadata;
+  requireDraftStatus?: boolean;
 }
 
 export const updateEnvelopeFields = async ({
@@ -41,6 +44,7 @@ export const updateEnvelopeFields = async ({
   type = null,
   fields,
   requestMetadata,
+  requireDraftStatus = false,
 }: UpdateEnvelopeFieldsOptions) => {
   const { envelopeWhereInput } = await getEnvelopeWhereInput({
     id,
@@ -64,9 +68,26 @@ export const updateEnvelopeFields = async ({
     });
   }
 
+  const isCorrelatedDocument =
+    envelope.type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(envelope.externalId);
+
+  if (isCorrelatedDocument) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Correlated document fields are immutable after creation',
+    });
+  }
+
   if (envelope.completedAt) {
     throw new AppError(AppErrorCode.INVALID_REQUEST, {
       message: 'Envelope already complete',
+    });
+  }
+
+  const mustBeDraft = requireDraftStatus;
+
+  if (mustBeDraft && envelope.status !== DocumentStatus.DRAFT) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Document is no longer a draft',
     });
   }
 
@@ -129,49 +150,63 @@ export const updateEnvelopeFields = async ({
   });
 
   const updatedFields = await prisma.$transaction(async (tx) => {
-    return await Promise.all(
-      fieldsToUpdate.map(async ({ originalField, updateData, recipientEmail }) => {
-        const updatedField = await tx.field.update({
-          where: {
-            id: updateData.id,
-          },
-          data: {
-            type: updateData.type,
-            page: updateData.pageNumber,
-            positionX: updateData.pageX,
-            positionY: updateData.pageY,
-            width: updateData.width,
-            height: updateData.height,
-            fieldMeta: updateData.fieldMeta,
-            envelopeItemId: updateData.envelopeItemId,
-          },
-        });
+    const updateFields = async () =>
+      await Promise.all(
+        fieldsToUpdate.map(async ({ originalField, updateData, recipientEmail }) => {
+          const updatedField = await tx.field.update({
+            where: {
+              id: updateData.id,
+            },
+            data: {
+              type: updateData.type,
+              page: updateData.pageNumber,
+              positionX: updateData.pageX,
+              positionY: updateData.pageY,
+              width: updateData.width,
+              height: updateData.height,
+              fieldMeta: updateData.fieldMeta,
+              envelopeItemId: updateData.envelopeItemId,
+            },
+          });
 
-        // Handle field updated audit log.
-        if (envelope.type === EnvelopeType.DOCUMENT) {
-          const changes = diffFieldChanges(originalField, updatedField);
+          // Handle field updated audit log.
+          if (envelope.type === EnvelopeType.DOCUMENT) {
+            const changes = diffFieldChanges(originalField, updatedField);
 
-          if (changes.length > 0) {
-            await tx.documentAuditLog.create({
-              data: createDocumentAuditLogData({
-                type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_UPDATED,
-                envelopeId: envelope.id,
-                metadata: requestMetadata,
-                data: {
-                  fieldId: updatedField.secondaryId,
-                  fieldRecipientEmail: recipientEmail,
-                  fieldRecipientId: updatedField.recipientId,
-                  fieldType: updatedField.type,
-                  changes,
-                },
-              }),
-            });
+            if (changes.length > 0) {
+              await tx.documentAuditLog.create({
+                data: createDocumentAuditLogData({
+                  type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_UPDATED,
+                  envelopeId: envelope.id,
+                  metadata: requestMetadata,
+                  data: {
+                    fieldId: updatedField.secondaryId,
+                    fieldRecipientEmail: recipientEmail,
+                    fieldRecipientId: updatedField.recipientId,
+                    fieldType: updatedField.type,
+                    changes,
+                  },
+                }),
+              });
+            }
           }
-        }
 
-        return updatedField;
-      }),
-    );
+          return updatedField;
+        }),
+      );
+
+    if (mustBeDraft) {
+      return withDocumentDraftMutationGuard(
+        {
+          tx,
+          envelopeId: envelope.id,
+          teamId,
+        },
+        updateFields,
+      );
+    }
+
+    return updateFields();
   });
 
   return {

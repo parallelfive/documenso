@@ -5,6 +5,8 @@ import {
   ZCreateTemplateV2ResponseSchema,
 } from '@documenso/trpc/server/template-router/schema';
 
+// P5 patch: admin REST surface for org + user CRUD. See P5_PATCHES.md § Patch 1.
+import { AdminContract } from './admin/contract';
 import {
   ZAuthorizationHeadersSchema,
   ZCreateDocumentFromTemplateMutationResponseSchema,
@@ -40,8 +42,6 @@ import {
   ZUpdateFieldMutationSchema,
   ZUpdateRecipientMutationSchema,
 } from './schema';
-// P5 patch: admin REST surface for org + user CRUD. See P5_PATCHES.md § Patch 1.
-import { AdminContract } from './admin/contract';
 
 const c = initContract();
 
@@ -71,6 +71,7 @@ export const ApiContractV1 = c.router(
         200: ZSuccessfulGetDocumentResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Get a single document',
       deprecated: true,
@@ -85,6 +86,7 @@ export const ApiContractV1 = c.router(
         200: ZDownloadDocumentSuccessfulSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Download a signed document when the storage transport is S3',
       deprecated: true,
@@ -114,8 +116,10 @@ export const ApiContractV1 = c.router(
       body: ZCreateDocumentMutationSchema,
       responses: {
         200: ZCreateDocumentMutationResponseSchema,
+        400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Upload a new document and get a presigned URL',
       deprecated: true,
@@ -144,6 +148,7 @@ export const ApiContractV1 = c.router(
         200: ZSuccessfulDeleteTemplateResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Delete a template',
       deprecated: true,
@@ -157,6 +162,7 @@ export const ApiContractV1 = c.router(
         200: ZSuccessfulGetTemplateResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Get a single template',
       deprecated: true,
@@ -216,6 +222,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Send a document for signing',
@@ -232,6 +239,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Re-send a document for signing',
@@ -247,6 +255,8 @@ export const ApiContractV1 = c.router(
         200: ZSuccessfulDocumentResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Delete a document',
       deprecated: true,
@@ -262,6 +272,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Create a recipient for a document',
@@ -278,6 +289,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Update a recipient for a document',
@@ -294,6 +306,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Delete a recipient from a document',
@@ -310,6 +323,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Create a field for a document',
@@ -326,6 +340,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Update a field for a document',
@@ -342,6 +357,7 @@ export const ApiContractV1 = c.router(
         400: ZUnsuccessfulResponseSchema,
         401: ZUnsuccessfulResponseSchema,
         404: ZUnsuccessfulResponseSchema,
+        409: ZUnsuccessfulResponseSchema,
         500: ZUnsuccessfulResponseSchema,
       },
       summary: 'Delete a field from a document',

@@ -4,10 +4,15 @@ This fork exists to maintain a patched Documenso image for the Parallel Five biz
 
 ## Why
 
-Documenso v1.12.10's public REST API only covers `/documents` and `/templates`. Org / User / branding / signing-URL-prefix surfaces are internal-only (tRPC, no OpenAPI). Biz-buddy needs them for:
+Documenso v1.12.10's public REST API only covers `/documents` and
+`/templates`. Org / User / branding / signing-URL-prefix surfaces are
+internal-only (tRPC, no OpenAPI). The fork retains the admin REST patch for
+operator compatibility, but production Biz Buddy now deliberately uses one
+locked Documenso service team: Biz Buddy workspace authorization is the tenant
+boundary and the provider API token's exact team is the service boundary.
 
-- **Workspace → Documenso Organisation auto-provisioning** — when biz-buddy creates a Workspace, biz-buddy provisions a Documenso Organisation via REST
-- **Lazy User → Documenso User mirror** — JIT user creation when a member or recipient first interacts with an envelope
+- **Legacy admin provisioning compatibility** — retained until the obsolete
+  per-workspace provider-organisation flow is fully removed
 - **Scoped signing callback** — Biz Buddy-owned recipient email links go to `bizbuddy.parallel5.com/sign/...` so Biz Buddy can enforce terminal state and fresh active-workspace membership for member recipients before redirecting to Documenso
 
 Rather than reach into Documenso's DB or call internal tRPC routes (both of which break on every Documenso upgrade), we maintain thin patches that expose the surfaces we need as proper REST + env-var-driven config.
@@ -138,27 +143,333 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   single-item document as raw `application/pdf`. It resolves Documenso's
   `BYTES`, `BYTES_64`, and `S3_PATH` storage forms through the existing
   `getFileServerSide()` abstraction and enforces a bounded response size.
-- **Why:** production uses Documenso's default database upload transport.
-  Upstream's `/download` route only returns a presigned URL for S3, so Biz
-  Buddy otherwise cannot durably capture the signed PDF after a completion
-  webhook.
+- **Why:** upstream's `/download` route only returns a presigned URL for S3,
+  while existing/fallback rows may use database storage. Biz Buddy needs one
+  bounded authenticated endpoint that can durably capture the signed PDF
+  regardless of transport. Production is pinned to S3 for new uploads.
 - **Authorization:** the normal API v1 bearer middleware authenticates the
-  token user/team and the endpoint additionally requires the returned
-  document's `teamId` to equal that token team exactly. Non-completed,
-  multi-item, oversized, invalid, and cross-scope documents fail closed.
+  token user/team and the endpoint adds that exact team to the database
+  predicate. Non-completed, zero/multi-item, oversized, invalid, and
+  cross-scope documents fail closed.
+- **Existing terminal-status GET:** the public
+  `GET /api/v1/documents/:id` route also adds the authenticated token team to
+  its database predicate and repeats the exact-team check before returning
+  recipients. It is the sole integration response that exposes the nullable,
+  signer-authored rejection reason, validated through the shared 2 KiB UTF-8
+  bound; webhook/job evidence remains reason-free. Expected denial/not-found
+  maps to 404; parse/database failures remain 500 instead of being disguised as
+  absence.
+- **Systemic API v1 team-token boundary:** every document-ID read/mutation
+  (download URL, delete, send/resend, recipient CRUD, and field CRUD) and every
+  template-ID read/mutation/use first resolves a capability-minimal exact-team
+  reference containing only internal envelope ID, team ID, and secondary ID.
+  Endpoint data is fetched only after that guard, downstream services receive
+  the guarded immutable envelope ID, and recipient/field children must belong
+  to the guarded path envelope. Document list queries add exact team before
+  count/pagination and use an uncapped full count for external recovery walks,
+  neutralizing both the product UI's intentional cross-team team-email branches
+  and its 100-page look-ahead optimization. Template list count/pagination
+  already applies exact team. The document-list response always includes the
+  authenticated token's positive `teamId`, including for an empty list, and
+  rejects any row whose team differs. Create-document returns that same
+  authenticated `teamId` plus the persisted `externalId`; single-document,
+  send, and delete responses also source `teamId` from the authenticated team
+  instead of treating returned row data as the trust anchor. List ordering
+  preserves the requested `createdAt` direction and adds `Envelope.id` in that
+  same direction as a deterministic tie-breaker for recovery pagination.
+- **Bounded loading:** the endpoint first selects only envelope lifecycle/item
+  metadata and document-data ID/type. A raw SQL preflight reads DB octet length
+  plus at most a two-character base64 suffix (or a bounded S3 key prefix)
+  before any PDF string is selected. The second DB query repeats expected
+  type/decoded-size predicates to close size races. S3 validates declared
+  length when present, streams and cancels at the cap when absent or lying,
+  and aborts stalled header/body reads after 15 seconds.
+- **Release invariant:** with
+  `NEXT_PUBLIC_DOCUMENT_SIZE_UPLOAD_LIMIT=50`, signed-document download is
+  capped at 60 MiB (upload cap plus 10 MiB sealing headroom, globally clamped
+  to 10–100 MiB).
 - **Files:**
   - `packages/api/v1/contract.ts` and `packages/api/v1/implementation.ts` —
     additive binary endpoint.
   - `packages/api/v1/download-document-data.ts` — storage-agnostic bounded
     loader.
+  - `packages/api/v1/get-document.ts` — exact-team lookup for the existing
+    status/recipient endpoint used during terminal reconciliation.
+  - `packages/api/v1/exact-team-envelope.ts` and
+    `packages/api/v1/exact-envelope-child.ts` — capability-minimal API token
+    team and nested-resource boundaries.
   - `packages/api/v1/download-document-data.test.ts` — completed, auth-scope,
-    lifecycle, item-count, size, and content validation.
+    lifecycle, item-count, pre-materialization/race size, S3-key, and content
+    validation.
+  - `packages/api/v1/get-document.test.ts` — cross-team owner/token denial and
+    precise 404/500 mapping.
+  - `packages/api/v1/schema.test.ts` — empty-list and wrong-team identity,
+    create correlation/team identity, standard send `id`/`teamId`, and
+    create-field wrapper-shape plus exact-GET-only bounded rejection-reason
+    regression coverage.
+  - `packages/api/v1/exact-envelope-child.test.ts` — cross-envelope recipient
+    and field binding plus all-recipient resend binding.
+  - `packages/lib/universal/upload/get-file.server.ts` and its focused tests —
+    optional decoded-byte and timeout limits with exact/+1, missing/lying
+    Content-Length, cancellation, and stalled-read coverage. Existing callers
+    retain the historical default when limits are omitted.
 - **Remove when:** upstream exposes an equivalent storage-agnostic signed
   document download API.
+
+### 5. Capability-safe webhook history — landed 2026-07-17
+
+- **Behavior:** the fork projects native document state into one strict,
+  explicit lifecycle allowlist _before enqueue_. BackgroundJob, local/BullMQ
+  queues, generic worker logs, first outbound callbacks, WebhookCall history,
+  automatic retries, and manual resends all carry only: document
+  ID/externalId/status/timestamps plus recipient provider
+  IDs/roles/statuses/timestamps. Signer-authored rejection text is excluded;
+  terminal consumers obtain it through the authenticated exact-team GET.
+- **Why:** the native internal snapshot includes live recipient signing tokens,
+  email/name, recipient/document auth options, form values, and email settings.
+  Enqueueing it wrote those capabilities to PostgreSQL, Redis/BullMQ, stdout,
+  team-visible webhook logs, and copy actions before any later redaction could
+  help.
+- **Excluded by construction:** duplicate legacy `Recipient` arrays, webhook
+  shared secret, signing tokens and URLs, email/name, auth settings, form
+  values, document metadata, rejection reason, and every future field not
+  deliberately added to the strict projection.
+- **Bounded fail-closed contract:** IDs are positive safe integers; lifecycle
+  roles/statuses are native enums; external IDs and ISO timestamps are length
+  bounded; recipient IDs are unique. Exact
+  `bizbuddy:<validated envelope UUID>` snapshots allow at most 25 recipients,
+  matching the integration boundary. Native snapshots have a finite
+  1,000-recipient operational ceiling. Malformed reserved `bizbuddy:` IDs,
+  unknown enums, invalid recipients, and 26/1,001-recipient snapshots are
+  rejected before enqueue rather than silently weakened or partially
+  delivered.
+- **Fan-out and receiver evidence:** envelope mapping plus projection/strict
+  parsing happens once inside the central boundary before fan-out. Discovery,
+  mapping, projection, and enqueue failures return structured
+  `{ matched, enqueued, failed }` evidence and are aggregated/logged without
+  payloads or capabilities. They never turn an already-committed document
+  transition into a false API/job failure or destructive retry. The
+  trigger-only test action targets only the selected webhook and surfaces its
+  projection/enqueue failure to the caller.
+  Receiver response persistence reads at most 64 KiB under the same 10-second
+  request deadline, cancels missing/lying-length overflow, stores only a small
+  response-header allowlist, and redacts reflected shared secrets and
+  authentication/cookie fields.
+- **Outbound SSRF and confidentiality boundary:** production webhook URLs are
+  parsed once, restricted to HTTPS, resolved fail-closed with a two-second
+  deadline, and rejected if any DNS answer is private or IANA special-purpose.
+  This includes mixed-answer, IPv4-mapped IPv6, benchmarking, documentation,
+  translation, ORCHID, ULA, link-local, multicast, and metadata ranges. Plain
+  HTTP is legal only for the narrowly scoped development bypass, which requires
+  an exact normalized hostname (never a suffix), still requires DNS success,
+  and returns the vetted address. The transport pins that address through a
+  custom Node lookup while preserving the original Host header and TLS
+  SNI/certificate verification, disables connection reuse, and never follows
+  redirects. A rebinding between validation and connect therefore cannot change
+  the destination, and lifecycle evidence plus the shared secret are not sent
+  over cleartext public transport. Webhook create/edit services run this same
+  asynchronous DNS-aware assertion before persistence. Their tRPC schema now
+  performs syntax-only URL validation so it cannot preempt the exact configured
+  local-development bypass with the legacy synchronous private-host check;
+  unset/production behavior remains HTTPS/global-only. The Zapier subscription
+  path authenticates its bearer before parsing or resolving the callback, so an
+  invalid caller cannot use the resolver as a DNS/work oracle.
+- **Transport resource bounds:** body streaming preserves Node backpressure and
+  propagates cancellation when the 64 KiB persistence limit is crossed.
+  Bodyless 204/205/304 responses are drained and persisted as `null`; malformed,
+  oversized, and stalled responses close their sockets without retaining
+  attacker-controlled error detail.
+- **Adjacent capability hardening:** provider request logs normalize every
+  `/sign/<bearer>` path to `/sign/[REDACTED]`. Rejection input is capped at
+  2 KiB of UTF-8 at both the recipient schema and service boundary, while the
+  safe webhook remains reason-free.
+- **Retry contract:** automatic retries replay the same safe lifecycle body.
+  New manual resends replay the stored safe evidence. Legacy full-body history
+  is projected before it can be re-enqueued, so old capabilities are never
+  reintroduced.
+- **Files:**
+  - `packages/lib/types/webhook-payload.ts` — strict lifecycle/evidence schemas,
+    explicit projection, and safe legacy-resend adapter.
+  - `packages/lib/server-only/webhooks/trigger/enqueue-webhook-delivery.ts` —
+    sole `internal.execute-webhook` producer and the pre-enqueue boundary.
+  - `packages/lib/server-only/webhooks/trigger/{trigger-webhook,handler}.ts` and
+    focused tests — both current and legacy trigger paths use the boundary.
+  - `packages/lib/jobs/definitions/internal/execute-webhook.handler.ts` —
+    sends the safe lifecycle body and persists versioned safe evidence.
+  - `packages/lib/jobs/definitions/internal/execute-webhook.handler.test.ts` —
+    recursively proves safe first outbound and persistence.
+  - `packages/lib/server-only/webhooks/execute-webhook-call.ts` — bounded,
+    sanitized receiver response evidence and DNS-pinned Node HTTP(S) transport.
+  - `packages/lib/server-only/webhooks/assert-webhook-url.ts` plus focused
+    resolver/transport tests — fail-closed DNS, IANA special-purpose range
+    policy, exact bypass behavior, TLS Host/SNI verification, and large chunked
+    response cancellation. `ipaddr.js` is a direct runtime dependency so the
+    address policy is not coupled to a transitive package.
+  - `packages/lib/server-only/webhooks/{create-webhook,edit-webhook}.ts` and the
+    tRPC webhook URL schema — asynchronous registration-time policy enforcement
+    with exact local-bypass compatibility; Zapier subscription applies the same
+    policy only after bearer validation.
+  - `packages/lib/utils/redact-sensitive-path.ts` and the Remix/request logger
+    call sites — signing-capability path redaction.
+  - `packages/lib/types/rejection-reason.ts` — shared UTF-8 rejection-reason
+    boundary.
+  - `packages/trpc/server/webhook-router/resend-webhook-call.ts` — routes new
+    and legacy rows through the same safe producer.
+- **Remove when:** upstream stores capability-safe webhook history with
+  equivalent pre-enqueue, delivery, retry, log, and persistence semantics.
+
+### 6. Atomic Biz Buddy execution lease and lifecycle invariants — landed 2026-07-17
+
+- **Dispatch lease:** a Biz Buddy-correlated send must include the exact
+  normalized provider execution graph it just persisted:
+  `externalId`, document `signingOrder`, recipients
+  (`id/name/email/role/signingOrder`), and fields
+  (`id/recipientId/type/page/positionX/positionY/width/height`), plus
+  `expectedPdf.sha256` as exact lower-case SHA-256 hex and
+  `expectedPdf.byteLength` as a positive safe integer. IDs are bounded, unique
+  positive integers; recipient identity is trim/NFC/lowercase normalized;
+  correlated recipient graphs contain 1–25 entries, and execution field graphs
+  contain at most 1,000 entries. Arrays are canonicalized before comparison.
+  Provider-only capabilities such as signing tokens can never enter the
+  snapshot.
+- **Exact PDF byte binding:** before claiming a correlated draft, the provider
+  bounded-reads the single V1 source item under the configured upload cap and a
+  30-second end-to-end deadline, then compares the exact raw byte length and
+  SHA-256. A mismatch returns 409 before any snapshot or database mutation.
+  Matching bytes are copied with server credentials to a fresh random,
+  internal-only object/`DocumentData` row whose key is never disclosed through
+  the client upload API. The locked lease reread binds both envelope-item ID and
+  original document-data ID; in the same `DRAFT → PENDING` transaction it swaps
+  that exact item to the fresh snapshot. Both ordinary signer dispatch and the
+  immediate no-action seal branch commit the swap before email/webhook/job
+  enqueue. Replaying the original one-hour presigned PUT can therefore alter
+  only the orphaned upload key, never the bytes later sealed or signed.
+- **Snapshot failure cleanup:** a losing/replayed send cleans only its own fresh
+  snapshot. Cleanup first proves the `DocumentData` has zero envelope-item
+  references, deletes the external object, then deletes the still-unreferenced
+  row with the same guard. A referenced row is never deleted, and cleanup
+  failure is bounded operational evidence that never replaces the original
+  dispatch error. The snapshot-specific upload path also best-effort deletes
+  its just-created S3 object if the subsequent `DocumentData` insert fails,
+  without changing generic/native upload behavior or masking the database
+  error.
+- **Atomic claim:** send changes `DRAFT` to `PENDING` with an exact-team,
+  document-type, exact-external-ID, draft-only predicate. In the same database
+  transaction it rereads the current external ID, team, signing order,
+  recipients, fields, item ID, and document-data pointer, then compares the
+  lease before audit logs, email settings, field insertion, recipient state, or
+  snapshot attachment can change. A mismatch rolls the transaction back with 409. Generic API v1 sends use the same atomic draft claim; a native path
+  cannot dispatch a `bizbuddy:` document without the lease.
+- **Reserved correlation namespace:** `bizbuddy:` is case-insensitively reserved
+  to the dedicated API v1 direct-document create path, which may mint only the
+  canonical `bizbuddy:<UUID>` form. Native document/template creation,
+  template generation/use, direct templates, updates, and alternate casing
+  cannot adopt the namespace. The correlated external ID cannot later be
+  changed or removed. Creation, lifecycle classification, callbacks, and strict
+  webhook projection share the same lowercase UUID-v1-through-v8 validator, so
+  no provider-valid correlation can later become an undeliverable webhook.
+- **Creation-time execution freeze:** correlated envelope/document metadata,
+  source items/PDFs, item title/order, and attachments are immutable from
+  creation, not merely after dispatch. Native item routes, embedding updates,
+  attachment routes, and admin recipient edits reject before uploads or
+  mutations. Because Biz Buddy V1 does not use attachments, document-level
+  authentication, or form values and the execution lease intentionally omits
+  those signer-visible graphs, correlated API v1 create rejects every nonempty
+  attachment, document-authentication setting, or defined form-value map before
+  issuing an upload URL or creating provider state. It also rejects
+  `allowDictateNextSigner: true` and forces the persisted value off as a
+  defensive create-path invariant. The recipient-completion mutation sink
+  independently ignores that flag for every correlated external ID, so a
+  historical or corrupt row cannot let a signer replace the next recipient's
+  frozen name/email after dispatch.
+- **One-time recipients and create-only fields:** direct create performs exactly
+  one correlated recipient population while the graph is empty. The draft lock
+  repeats both the exact external ID and a no-recipient predicate, then recounts
+  recipients after acquiring the row lock so concurrent initial writers cannot
+  both win. Recipient append/update/delete and replacement are rejected from
+  then on. The shared execution profile requires 1–25 initial recipients,
+  normalized nonempty names of at most 500 characters, and normalized valid
+  emails of at most 320 characters. They must all be `SIGNER`s, cannot carry
+  access/action authentication, and may use only null or positive integer
+  signing-order cohorts. Coordinate-based field creation remains legal only
+  for `SIGNATURE` fields with positive integral pages, finite coordinates,
+  finite positive dimensions, and no caller-provided metadata, custom text,
+  inserted state, or placeholder while `DRAFT` under the same exact-ID lock.
+  After acquiring that lock, each writer recounts fields and rejects a batch
+  that would push the immutable execution graph above 1,000 before creating any
+  row. Field update/delete/editor replacement and placeholder/auto-placement
+  writes are rejected from creation. Native document behavior is unchanged.
+  This preserves the exact Biz Buddy create flow while eliminating stale-draft
+  and omitted-subgraph races.
+- **Cancellation:** API v1 cancellation is legal only from `DRAFT` or
+  `PENDING`. The delete predicate repeats that status condition atomically; a
+  completion/rejection race returns 409 and sends no cancellation webhook or
+  email. The shared delete service enables this strict predicate automatically
+  for every correlated external ID, including native document/envelope and
+  bulk-delete callers that do not pass the API option. Native UI deletion
+  retains its prior behavior for non-integration documents.
+- **Reminder eligibility and linearization:** API v1 resend accepts only current
+  unsigned non-CC recipients while the document is `PENDING`. Parallel
+  documents permit any such recipient; sequential documents permit only the
+  lowest active signing-order cohort. Eligibility is reread immediately before
+  mail delivery so a cancellation that wins first produces no message. The
+  shared resend service enables both checks automatically for every correlated
+  external ID, including native redistribute callers. Once mail succeeds, a
+  later audit-write failure is logged without payloads and is not returned as
+  a false failure that could duplicate delivery.
+- **Recovery responses:** exact-team document GET includes the validated native
+  signing order used by the lease. Single-document, send, delete, and nested
+  mutation responses retain `folderId` where the public contract promises it.
+  All stale-state and concurrent-transition failures use the shared 409
+  `CONFLICT` mapping.
+- **Files:**
+  - `packages/lib/types/document-execution-profile.ts` — shared correlated
+    recipient, identity, and field representability limits used at creation,
+    lease, and webhook boundaries.
+  - `packages/lib/types/document-execution.ts` — bounded, capability-minimal
+    canonical graph/PDF lease schema and comparator.
+  - `packages/lib/server-only/document/send-document.ts` and
+    `with-document-draft-mutation-guard.ts` — bounded raw-byte verification,
+    fresh internal snapshot, transactional item swap/draft claim, locked
+    reread, cleanup, and reusable graph-mutation guard.
+  - `packages/lib/server-only/envelope/assert-bizbuddy-external-id-authorized.ts`
+    and `packages/lib/constants/app.ts` — canonical namespace ownership and
+    case-insensitive lifecycle classification.
+  - `packages/lib/server-only/{recipient,field,envelope,document-meta,envelope-attachment}/`
+    mutation services and correlated creation-profile guards plus native
+    envelope/embedding routes — creation-time execution/content freeze and
+    one-time population boundary.
+  - `packages/lib/universal/upload/put-file.server.ts` — fresh server-credential
+    snapshot upload using an undisclosed random key plus snapshot-only
+    post-upload row-failure orphan cleanup.
+  - `packages/lib/server-only/document/{delete-document,resend-document,complete-document-with-token}.ts`
+    — automatic correlated cancellation/reminder strictness and the historical
+    next-signer identity-mutation sink boundary.
+  - Focused execution, immutability, send, cancel, resend, API-schema, and
+    response tests cover byte/digest mismatch, original-presign replay,
+    item-pointer races, both send branches, cleanup reference guards,
+    mismatch rollback, double-send, terminal races, namespace minting, and
+    native/admin/embedding/attachment bypass attempts, native lifecycle-route
+    bypasses, and historical correlated next-signer metadata.
+- **Remove when:** upstream offers an equivalent exact-graph idempotency lease,
+  atomic lifecycle transitions, and post-dispatch execution immutability across
+  both REST and native mutation paths.
 
 ## Planned Patches
 
 (none — all patches are active and documented above)
+
+## Release-enabling baseline repairs
+
+- The repository's existing
+  `patches/@ai-sdk+google-vertex+3.0.81.patch` adds the Express-mode `apiKey`
+  type and `x-goog-api-key` runtime behavior consumed by
+  `packages/lib/server-only/ai/google.ts`. Docker/clean `npm ci` applies it
+  through `postinstall: patch-package`. A reused checkout can have stale,
+  unpatched `node_modules` and produce a false `apiKey` type error; run the
+  repository postinstall before any release typecheck. Never “fix” that drift by
+  removing `apiKey`, which silently disables the documented production auth
+  path.
 
 ## Maintenance discipline
 

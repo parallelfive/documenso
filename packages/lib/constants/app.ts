@@ -8,7 +8,20 @@ export const NEXT_PUBLIC_WEBAPP_URL = () =>
 
 const stripTrailingSlashes = (value: string) => value.trim().replace(/\/+$/, '');
 const BIZBUDDY_EXTERNAL_ID_PATTERN =
-  /^bizbuddy:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+  /^bizbuddy:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
+
+/**
+ * Biz Buddy owns this external-ID namespace. Treat it case-insensitively so
+ * alternate casing cannot bypass lifecycle controls while still matching
+ * callback projection.
+ */
+export const isBizBuddyExternalId = (externalId: string | null | undefined): externalId is string =>
+  externalId?.toLowerCase().startsWith('bizbuddy:') === true;
+
+export const isValidBizBuddyExternalId = (
+  externalId: string | null | undefined,
+): externalId is string =>
+  externalId !== undefined && externalId !== null && BIZBUDDY_EXTERNAL_ID_PATTERN.test(externalId);
 
 /**
  * Build the recipient-facing signing link.

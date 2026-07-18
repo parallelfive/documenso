@@ -39,10 +39,7 @@ import {
   ZFieldMetaSchema,
   ZRadioFieldMeta,
 } from '../../types/field-meta';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import type { ApiRequestMetadata } from '../../universal/extract-request-metadata';
 import { getFileServerSide } from '../../universal/upload/get-file.server';
 import { putNormalizedPdfFileServerSide } from '../../universal/upload/put-file.server';
@@ -56,6 +53,7 @@ import {
 import type { EnvelopeIdOptions } from '../../utils/envelope';
 import { mapSecondaryIdToTemplateId } from '../../utils/envelope';
 import { buildTeamWhereQuery } from '../../utils/teams';
+import { assertBizBuddyExternalIdAuthorized } from '../envelope/assert-bizbuddy-external-id-authorized';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 import { incrementDocumentId } from '../envelope/increment-id';
 import { insertFormValuesInPdf } from '../pdf/insert-form-values-in-pdf';
@@ -356,6 +354,10 @@ export const createDocumentFromTemplate = async ({
       message: 'Template not found',
     });
   }
+
+  assertBizBuddyExternalIdAuthorized({
+    externalId: externalId || template.externalId,
+  });
 
   if (folderId) {
     const folder = await prisma.folder.findUnique({
@@ -784,13 +786,13 @@ export const createDocumentFromTemplate = async ({
   await Promise.allSettled([
     triggerWebhook({
       event: WebhookTriggerEvents.DOCUMENT_CREATED,
-      data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(createdEnvelope)),
+      data: () => mapEnvelopeToWebhookDocumentPayload(createdEnvelope),
       userId,
       teamId,
     }),
     triggerWebhook({
       event: WebhookTriggerEvents.TEMPLATE_USED,
-      data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(createdEnvelope)),
+      data: () => mapEnvelopeToWebhookDocumentPayload(createdEnvelope),
       userId,
       teamId,
     }),

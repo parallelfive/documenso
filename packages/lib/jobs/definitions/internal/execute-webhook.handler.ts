@@ -2,6 +2,7 @@ import type { Prisma } from '@prisma/client';
 import { WebhookCallStatus } from '@prisma/client';
 
 import { executeWebhookCall } from '@documenso/lib/server-only/webhooks/execute-webhook-call';
+import { projectWebhookCallEvidence } from '@documenso/lib/types/webhook-payload';
 import { prisma } from '@documenso/prisma';
 
 import type { JobRunIO } from '../../client/_internal/job';
@@ -30,6 +31,7 @@ export const run = async ({
     createdAt: new Date().toISOString(),
     webhookEndpoint: url,
   };
+  const requestEvidence = projectWebhookCallEvidence(payloadData);
 
   const result = await executeWebhookCall({ url, body: payloadData, secret });
 
@@ -39,7 +41,7 @@ export const run = async ({
       event,
       status: result.success ? WebhookCallStatus.SUCCESS : WebhookCallStatus.FAILED,
       // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
-      requestBody: payloadData as Prisma.InputJsonValue,
+      requestBody: requestEvidence as Prisma.InputJsonValue,
       responseCode: result.responseCode,
       responseBody: result.responseBody,
       responseHeaders: result.responseHeaders,

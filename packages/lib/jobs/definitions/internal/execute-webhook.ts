@@ -1,17 +1,20 @@
 import { WebhookTriggerEvents } from '@prisma/client';
 import { z } from 'zod';
 
+import { ZWebhookLifecycleDocumentSchema } from '../../../types/webhook-payload';
 import { ZRequestMetadataSchema } from '../../../universal/extract-request-metadata';
 import { type JobDefinition } from '../../client/_internal/job';
 
 const EXECUTE_WEBHOOK_JOB_DEFINITION_ID = 'internal.execute-webhook';
 
-const EXECUTE_WEBHOOK_JOB_DEFINITION_SCHEMA = z.object({
-  event: z.nativeEnum(WebhookTriggerEvents),
-  webhookId: z.string(),
-  data: z.unknown(),
-  requestMetadata: ZRequestMetadataSchema.optional(),
-});
+const EXECUTE_WEBHOOK_JOB_DEFINITION_SCHEMA = z
+  .object({
+    event: z.nativeEnum(WebhookTriggerEvents),
+    webhookId: z.string().min(1).max(64),
+    data: ZWebhookLifecycleDocumentSchema,
+    requestMetadata: ZRequestMetadataSchema.optional(),
+  })
+  .strict();
 
 export type TExecuteWebhookJobDefinition = z.infer<typeof EXECUTE_WEBHOOK_JOB_DEFINITION_SCHEMA>;
 

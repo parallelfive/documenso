@@ -8,6 +8,7 @@ import { UNSAFE_createEnvelopeItems } from '@documenso/lib/server-only/envelope-
 import { UNSAFE_deleteEnvelopeItem } from '@documenso/lib/server-only/envelope-item/delete-envelope-item';
 import { UNSAFE_replaceEnvelopeItemPdf } from '@documenso/lib/server-only/envelope-item/replace-envelope-item-pdf';
 import { UNSAFE_updateEnvelopeItems } from '@documenso/lib/server-only/envelope-item/update-envelope-items';
+import { assertCorrelatedDocumentContentImmutable } from '@documenso/lib/server-only/envelope/assert-correlated-document-content-immutable';
 import { getEnvelopeWhereInput } from '@documenso/lib/server-only/envelope/get-envelope-by-id';
 import { updateEnvelope } from '@documenso/lib/server-only/envelope/update-envelope';
 import { setFieldsForDocument } from '@documenso/lib/server-only/field/set-fields-for-document';
@@ -86,6 +87,8 @@ export const updateEmbeddingEnvelopeRoute = procedure
         message: 'Envelope not found',
       });
     }
+
+    assertCorrelatedDocumentContentImmutable(envelope);
 
     if (envelope.status === DocumentStatus.COMPLETED) {
       throw new AppError(AppErrorCode.INVALID_REQUEST, {

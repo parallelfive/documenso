@@ -5,6 +5,7 @@ import { prisma } from '@documenso/prisma';
 import { TEAM_MEMBER_ROLE_PERMISSIONS_MAP } from '../../constants/teams';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { buildTeamWhereQuery } from '../../utils/teams';
+import { assertNotPrivateUrl } from './assert-webhook-url';
 
 export interface CreateWebhookOptions {
   webhookUrl: string;
@@ -36,6 +37,8 @@ export const createWebhook = async ({
       message: 'Team not found',
     });
   }
+
+  await assertNotPrivateUrl(webhookUrl);
 
   return await prisma.webhook.create({
     data: {

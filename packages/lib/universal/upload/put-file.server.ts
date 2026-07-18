@@ -8,7 +8,8 @@ import { env } from '@documenso/lib/utils/env';
 import { AppError } from '../../errors/app-error';
 import { createDocumentData } from '../../server-only/document-data/create-document-data';
 import { normalizePdf } from '../../server-only/pdf/normalize-pdf';
-import { uploadS3File } from './server-actions';
+import { logger } from '../../utils/logger';
+import { deleteS3File, uploadS3File } from './server-actions';
 
 type File = {
   name: string;
@@ -21,6 +22,22 @@ type File = {
  * a document data record.
  */
 export const putPdfFileServerSide = async (file: File, initialData?: string) => {
+  return putPdfFile(file, initialData);
+};
+
+/**
+ * Stores a PDF snapshot through server credentials under a fresh random key.
+ * The key is never exposed through the client upload API.
+ */
+export const putInternalPdfSnapshotServerSide = async (file: File) => {
+  return putPdfFile(file, undefined, true);
+};
+
+const putPdfFile = async (
+  file: File,
+  initialData?: string,
+  cleanupExternalUploadOnDataFailure = false,
+) => {
   const isEncryptedDocumentsAllowed = false; // Was feature flag.
 
   const arrayBuffer = await file.arrayBuffer();
@@ -41,7 +58,24 @@ export const putPdfFileServerSide = async (file: File, initialData?: string) => 
 
   const { type, data } = await putFileServerSide(file);
 
-  const createdData = await createDocumentData({ type, data, initialData });
+  let createdData: Awaited<ReturnType<typeof createDocumentData>>;
+
+  try {
+    createdData = await createDocumentData({ type, data, initialData });
+  } catch (error) {
+    if (cleanupExternalUploadOnDataFailure && type === DocumentDataType.S3_PATH) {
+      try {
+        await deleteS3File(data);
+      } catch (cleanupError) {
+        logger.error({
+          event: 'internal-pdf-snapshot-orphan-cleanup-failed',
+          errorName: cleanupError instanceof Error ? cleanupError.name : 'UnknownError',
+        });
+      }
+    }
+
+    throw error;
+  }
 
   return {
     documentData: createdData,

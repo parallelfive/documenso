@@ -1,7 +1,7 @@
 import { createElement } from 'react';
 
 import { msg } from '@lingui/core/macro';
-import { EnvelopeType, SendStatus } from '@prisma/client';
+import { DocumentStatus, EnvelopeType, SendStatus } from '@prisma/client';
 
 import { mailer } from '@documenso/email/mailer';
 import RecipientRemovedFromDocumentTemplate from '@documenso/email/templates/recipient-removed-from-document';
@@ -10,13 +10,14 @@ import type { ApiRequestMetadata } from '@documenso/lib/universal/extract-reques
 import { prisma } from '@documenso/prisma';
 
 import { getI18nInstance } from '../../client-only/providers/i18n-server';
-import { NEXT_PUBLIC_WEBAPP_URL } from '../../constants/app';
+import { NEXT_PUBLIC_WEBAPP_URL, isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { extractDerivedDocumentEmailSettings } from '../../types/document-email';
 import { createDocumentAuditLogData } from '../../utils/document-audit-logs';
 import { canRecipientBeModified, isRecipientEmailValidForSending } from '../../utils/recipients';
 import { renderEmailWithI18N } from '../../utils/render-email-with-i18n';
 import { buildTeamWhereQuery } from '../../utils/teams';
+import { withDocumentDraftMutationGuard } from '../document/with-document-draft-mutation-guard';
 import { getEmailContext } from '../email/get-email-context';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 
@@ -24,17 +25,22 @@ export interface DeleteEnvelopeRecipientOptions {
   userId: number;
   teamId: number;
   recipientId: number;
+  envelopeId?: string;
   requestMetadata: ApiRequestMetadata;
+  requireDraftStatus?: boolean;
 }
 
 export const deleteEnvelopeRecipient = async ({
   userId,
   teamId,
   recipientId,
+  envelopeId,
   requestMetadata,
+  requireDraftStatus = false,
 }: DeleteEnvelopeRecipientOptions) => {
   const envelope = await prisma.envelope.findFirst({
     where: {
+      id: envelopeId,
       recipients: {
         some: {
           id: recipientId,
@@ -73,9 +79,26 @@ export const deleteEnvelopeRecipient = async ({
     });
   }
 
+  const isCorrelatedDocument =
+    envelope.type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(envelope.externalId);
+
+  if (isCorrelatedDocument) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Correlated document recipients are immutable after initial population',
+    });
+  }
+
   if (envelope.completedAt) {
     throw new AppError(AppErrorCode.INVALID_REQUEST, {
       message: 'Document already complete',
+    });
+  }
+
+  const mustBeDraft = requireDraftStatus;
+
+  if (mustBeDraft && envelope.status !== DocumentStatus.DRAFT) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Document is no longer a draft',
     });
   }
 
@@ -110,28 +133,43 @@ export const deleteEnvelopeRecipient = async ({
   });
 
   const deletedRecipient = await prisma.$transaction(async (tx) => {
-    if (envelope.type === EnvelopeType.DOCUMENT) {
-      await tx.documentAuditLog.create({
-        data: createDocumentAuditLogData({
-          type: DOCUMENT_AUDIT_LOG_TYPE.RECIPIENT_DELETED,
-          envelopeId: envelope.id,
-          metadata: requestMetadata,
-          data: {
-            recipientEmail: recipientToDelete.email,
-            recipientName: recipientToDelete.name,
-            recipientId: recipientToDelete.id,
-            recipientRole: recipientToDelete.role,
-          },
-        }),
+    const deleteRecipient = async () => {
+      if (envelope.type === EnvelopeType.DOCUMENT) {
+        await tx.documentAuditLog.create({
+          data: createDocumentAuditLogData({
+            type: DOCUMENT_AUDIT_LOG_TYPE.RECIPIENT_DELETED,
+            envelopeId: envelope.id,
+            metadata: requestMetadata,
+            data: {
+              recipientEmail: recipientToDelete.email,
+              recipientName: recipientToDelete.name,
+              recipientId: recipientToDelete.id,
+              recipientRole: recipientToDelete.role,
+            },
+          }),
+        });
+      }
+
+      return await tx.recipient.delete({
+        where: {
+          id: recipientId,
+          envelope: envelopeWhereInput,
+        },
       });
+    };
+
+    if (mustBeDraft) {
+      return withDocumentDraftMutationGuard(
+        {
+          tx,
+          envelopeId: envelope.id,
+          teamId,
+        },
+        deleteRecipient,
+      );
     }
 
-    return await tx.recipient.delete({
-      where: {
-        id: recipientId,
-        envelope: envelopeWhereInput,
-      },
-    });
+    return deleteRecipient();
   });
 
   const isRecipientRemovedEmailEnabled = extractDerivedDocumentEmailSettings(

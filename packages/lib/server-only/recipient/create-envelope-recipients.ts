@@ -10,6 +10,7 @@ import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-
 import { createRecipientAuthOptions } from '@documenso/lib/utils/document-auth';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
 import { mapRecipientToLegacyRecipient } from '../../utils/recipients';
@@ -72,6 +73,15 @@ export const createEnvelopeRecipients = async ({
     });
   }
 
+  const isCorrelatedDocument =
+    envelope.type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(envelope.externalId);
+
+  if (isCorrelatedDocument) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Correlated document recipients are immutable after initial population',
+    });
+  }
+
   const recipientsHaveActionAuth = recipientsToCreate.some(
     (recipient) => recipient.actionAuth && recipient.actionAuth.length > 0,
   );
@@ -88,8 +98,8 @@ export const createEnvelopeRecipients = async ({
     email: recipient.email.toLowerCase(),
   }));
 
-  const createdRecipients = await prisma.$transaction(async (tx) => {
-    return await Promise.all(
+  const createdRecipients = await prisma.$transaction(async (tx) =>
+    Promise.all(
       normalizedRecipients.map(async (recipient) => {
         const authOptions = createRecipientAuthOptions({
           accessAuth: recipient.accessAuth ?? [],
@@ -132,8 +142,8 @@ export const createEnvelopeRecipients = async ({
 
         return createdRecipient;
       }),
-    );
-  });
+    ),
+  );
 
   return {
     recipients: createdRecipients.map((recipient) =>

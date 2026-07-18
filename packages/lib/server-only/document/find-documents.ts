@@ -33,8 +33,15 @@ export type FindDocumentsOptions = {
   query?: string;
   folderId?: string;
   /**
-   * When true (default), use a windowed count that caps early for faster pagination.
-   * When false, use a full COUNT(*) for exact totals — preferred for external API consumers.
+   * Restrict results to the selected team's own envelopes before count and
+   * pagination. API tokens are team-bound and must not inherit the UI's
+   * cross-team team-email sender/recipient branches.
+   */
+  exactTeamOnly?: boolean;
+  /**
+   * When true, use a windowed count that caps early for faster pagination.
+   * Defaults to true for UI queries and false for exact-team external API
+   * queries. Set explicitly to false for other exact-total consumers.
    */
   useWindowedCount?: boolean;
 };
@@ -59,7 +66,7 @@ const RECIPIENT_SEARCH_CAP = 1000;
 
 // Kysely query builder type for Envelope queries.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type EnvelopeQueryBuilder = SelectQueryBuilder<DB, 'Envelope', any>;
+export type EnvelopeQueryBuilder = SelectQueryBuilder<DB, 'Envelope', any>;
 
 // Expression builder type scoped to Envelope table context.
 type EnvelopeExpressionBuilder = ExpressionBuilder<DB, 'Envelope'>;
@@ -98,6 +105,33 @@ const senderEmailIs = (eb: EnvelopeExpressionBuilder, email: string) =>
       .select(sql.lit(1).as('one')),
   );
 
+export const applyExactTeamOnlyDocumentFilter = (
+  query: EnvelopeQueryBuilder,
+  exactTeamOnly: boolean,
+  teamId: number | undefined,
+) => {
+  if (!exactTeamOnly) {
+    return query;
+  }
+
+  if (!teamId) {
+    throw new Error('Exact-team document queries require a team ID');
+  }
+
+  return query.where('Envelope.teamId', '=', teamId);
+};
+
+export const resolveUseWindowedDocumentCount = (
+  exactTeamOnly: boolean,
+  requested: boolean | undefined,
+): boolean => requested ?? !exactTeamOnly;
+
+export const applyDeterministicDocumentOrder = (
+  query: EnvelopeQueryBuilder,
+  column: keyof Pick<Envelope, 'createdAt'>,
+  direction: 'asc' | 'desc',
+) => query.orderBy(`Envelope.${column}`, direction).orderBy('Envelope.id', direction);
+
 export const findDocuments = async ({
   userId,
   teamId,
@@ -111,8 +145,14 @@ export const findDocuments = async ({
   senderIds,
   query = '',
   folderId,
-  useWindowedCount = true,
+  exactTeamOnly = false,
+  useWindowedCount: requestedUseWindowedCount,
 }: FindDocumentsOptions) => {
+  const useWindowedCount = resolveUseWindowedDocumentCount(
+    exactTeamOnly,
+    requestedUseWindowedCount,
+  );
+
   const user = await prisma.user.findFirstOrThrow({
     where: { id: userId },
     select: { id: true, email: true, name: true },
@@ -143,6 +183,7 @@ export const findDocuments = async ({
 
     // Type must be DOCUMENT (enum cast requires raw sql — this is the one escape hatch)
     qb = qb.where('Envelope.type', '=', sql.lit(EnvelopeType.DOCUMENT));
+    qb = applyExactTeamOnlyDocumentFilter(qb, exactTeamOnly, team?.id);
 
     // Folder filter
     qb =
@@ -466,8 +507,7 @@ export const findDocuments = async ({
   const offset = Math.max(page - 1, 0) * perPage;
 
   // Data query: paginated, executed directly via Kysely query builder
-  const dataQuery = filteredQuery
-    .orderBy(`Envelope.${orderByColumn}`, orderByDirection)
+  const dataQuery = applyDeterministicDocumentOrder(filteredQuery, orderByColumn, orderByDirection)
     .limit(perPage)
     .offset(offset);
 

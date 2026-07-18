@@ -9,6 +9,7 @@ export enum AppErrorCode {
   'EXPIRED_CODE' = 'EXPIRED_CODE',
   'INVALID_BODY' = 'INVALID_BODY',
   'INVALID_REQUEST' = 'INVALID_REQUEST',
+  'CONFLICT' = 'CONFLICT',
   'RECIPIENT_EXPIRED' = 'RECIPIENT_EXPIRED',
   'LIMIT_EXCEEDED' = 'LIMIT_EXCEEDED',
   'NOT_FOUND' = 'NOT_FOUND',
@@ -30,6 +31,7 @@ export const genericErrorCodeToTrpcErrorCodeMap: Record<string, { code: string; 
     [AppErrorCode.EXPIRED_CODE]: { code: 'BAD_REQUEST', status: 400 },
     [AppErrorCode.INVALID_BODY]: { code: 'BAD_REQUEST', status: 400 },
     [AppErrorCode.INVALID_REQUEST]: { code: 'BAD_REQUEST', status: 400 },
+    [AppErrorCode.CONFLICT]: { code: 'CONFLICT', status: 409 },
     [AppErrorCode.INVALID_CAPTCHA]: { code: 'BAD_REQUEST', status: 400 },
     [AppErrorCode.NOT_FOUND]: { code: 'NOT_FOUND', status: 404 },
     [AppErrorCode.NOT_SETUP]: { code: 'BAD_REQUEST', status: 400 },
@@ -216,7 +218,7 @@ export class AppError extends Error {
   }
 
   static toRestAPIError(err: unknown): {
-    status: 400 | 401 | 404 | 500;
+    status: 400 | 401 | 404 | 409 | 500;
     body: { message: string };
   } {
     const error = AppError.parseError(err);
@@ -225,6 +227,7 @@ export class AppError extends Error {
       .with(AppErrorCode.INVALID_BODY, AppErrorCode.INVALID_REQUEST, () => 400 as const)
       .with(AppErrorCode.UNAUTHORIZED, () => 401 as const)
       .with(AppErrorCode.NOT_FOUND, () => 404 as const)
+      .with(AppErrorCode.CONFLICT, () => 409 as const)
       .otherwise(() => 500 as const);
 
     return {

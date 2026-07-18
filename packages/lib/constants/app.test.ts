@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildRecipientSigningLink } from './app';
+import { buildRecipientSigningLink, isBizBuddyExternalId } from './app';
 
 describe('buildRecipientSigningLink', () => {
   it.each([
@@ -16,9 +16,7 @@ describe('buildRecipientSigningLink', () => {
         signingUrlPrefix: prefix,
         webappUrl: 'https://documenso.example',
       }),
-    ).toBe(
-      'https://bizbuddy.example/sign/123e4567-e89b-42d3-a456-426614174000?p=provider%2Btoken',
-    );
+    ).toBe('https://bizbuddy.example/sign/123e4567-e89b-42d3-a456-426614174000?p=provider%2Btoken');
   });
 
   it('keeps the native Documenso link when the callback prefix is not configured', () => {
@@ -68,4 +66,21 @@ describe('buildRecipientSigningLink', () => {
       }),
     ).toBe('https://documenso.example/sign/provider-token');
   });
+});
+
+describe('isBizBuddyExternalId', () => {
+  it.each([
+    'bizbuddy:123e4567-e89b-42d3-a456-426614174000',
+    'BIZBUDDY:123e4567-e89b-42d3-a456-426614174000',
+    'BizBuddy:reserved',
+  ])('recognizes the reserved namespace case-insensitively: %s', (externalId) => {
+    expect(isBizBuddyExternalId(externalId)).toBe(true);
+  });
+
+  it.each([null, undefined, '', 'native:document', ' bizbuddy:reserved'])(
+    'does not claim unrelated external IDs: %s',
+    (externalId) => {
+      expect(isBizBuddyExternalId(externalId)).toBe(false);
+    },
+  );
 });
