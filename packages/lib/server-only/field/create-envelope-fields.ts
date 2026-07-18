@@ -1,5 +1,5 @@
 import { PDF } from '@libpdf/core';
-import { EnvelopeType } from '@prisma/client';
+import { DocumentStatus, EnvelopeType } from '@prisma/client';
 
 import { DOCUMENT_AUDIT_LOG_TYPE } from '@documenso/lib/types/document-audit-logs';
 import type { TFieldAndMeta } from '@documenso/lib/types/field-meta';
@@ -9,12 +9,15 @@ import { putPdfFileServerSide } from '@documenso/lib/universal/upload/put-file.s
 import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
 import { mapFieldToLegacyField } from '../../utils/fields';
 import { canRecipientFieldsBeModified } from '../../utils/recipients';
+import { withDocumentDraftMutationGuard } from '../document/with-document-draft-mutation-guard';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 import { type BoundingBox, whiteoutRegions } from '../pdf/auto-place-fields';
+import { assertCorrelatedDocumentFieldCreationAllowed } from './assert-correlated-document-field-creation';
 
 type CoordinatePosition = {
   page: number;
@@ -99,6 +102,20 @@ export const createEnvelopeFields = async ({
       message: 'Envelope already complete',
     });
   }
+
+  const mustBeDraft =
+    envelope.type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(envelope.externalId);
+
+  if (mustBeDraft && envelope.status !== DocumentStatus.DRAFT) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Document is no longer a draft',
+    });
+  }
+
+  assertCorrelatedDocumentFieldCreationAllowed({
+    externalId: envelope.externalId,
+    fields,
+  });
 
   const firstEnvelopeItem = envelope.envelopeItems[0];
 
@@ -244,47 +261,77 @@ export const createEnvelopeFields = async ({
   });
 
   const createdFields = await prisma.$transaction(async (tx) => {
-    const newlyCreatedFields = await tx.field.createManyAndReturn({
-      data: validatedFields.map((field) => ({
-        type: field.type,
-        page: field.page,
-        positionX: field.positionX,
-        positionY: field.positionY,
-        width: field.width,
-        height: field.height,
-        customText: '',
-        inserted: false,
-        fieldMeta: field.fieldMeta,
-        envelopeId: envelope.id,
-        envelopeItemId: field.envelopeItemId,
-        recipientId: field.recipientId,
-      })),
-    });
-
-    // Handle field created audit log.
-    if (envelope.type === EnvelopeType.DOCUMENT) {
-      await tx.documentAuditLog.createMany({
-        data: newlyCreatedFields.map((createdField) => {
-          const recipient = validatedFields.find(
-            (field) => field.recipientId === createdField.recipientId,
-          );
-
-          return createDocumentAuditLogData({
-            type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_CREATED,
+    const createFields = async () => {
+      if (mustBeDraft) {
+        const existingFieldCount = await tx.field.count({
+          where: {
             envelopeId: envelope.id,
-            metadata: requestMetadata,
-            data: {
-              fieldId: createdField.secondaryId,
-              fieldRecipientEmail: recipient?.recipientEmail || '',
-              fieldRecipientId: createdField.recipientId,
-              fieldType: createdField.type,
-            },
-          });
-        }),
+          },
+        });
+
+        assertCorrelatedDocumentFieldCreationAllowed({
+          externalId: envelope.externalId,
+          fields: validatedFields,
+          existingFieldCount,
+        });
+      }
+
+      const newlyCreatedFields = await tx.field.createManyAndReturn({
+        data: validatedFields.map((field) => ({
+          type: field.type,
+          page: field.page,
+          positionX: field.positionX,
+          positionY: field.positionY,
+          width: field.width,
+          height: field.height,
+          customText: '',
+          inserted: false,
+          fieldMeta: field.fieldMeta,
+          envelopeId: envelope.id,
+          envelopeItemId: field.envelopeItemId,
+          recipientId: field.recipientId,
+        })),
       });
+
+      // Handle field created audit log.
+      if (envelope.type === EnvelopeType.DOCUMENT) {
+        await tx.documentAuditLog.createMany({
+          data: newlyCreatedFields.map((createdField) => {
+            const recipient = validatedFields.find(
+              (field) => field.recipientId === createdField.recipientId,
+            );
+
+            return createDocumentAuditLogData({
+              type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_CREATED,
+              envelopeId: envelope.id,
+              metadata: requestMetadata,
+              data: {
+                fieldId: createdField.secondaryId,
+                fieldRecipientEmail: recipient?.recipientEmail || '',
+                fieldRecipientId: createdField.recipientId,
+                fieldType: createdField.type,
+              },
+            });
+          }),
+        });
+      }
+
+      return newlyCreatedFields;
+    };
+
+    if (mustBeDraft) {
+      return withDocumentDraftMutationGuard(
+        {
+          tx,
+          envelopeId: envelope.id,
+          teamId,
+          expectedExternalId: envelope.externalId!,
+        },
+        createFields,
+      );
     }
 
-    return newlyCreatedFields;
+    return createFields();
   });
 
   /*

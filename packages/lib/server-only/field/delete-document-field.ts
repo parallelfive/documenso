@@ -1,31 +1,38 @@
-import { EnvelopeType } from '@prisma/client';
+import { DocumentStatus, EnvelopeType } from '@prisma/client';
 
 import { DOCUMENT_AUDIT_LOG_TYPE } from '@documenso/lib/types/document-audit-logs';
 import type { ApiRequestMetadata } from '@documenso/lib/universal/extract-request-metadata';
 import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { canRecipientFieldsBeModified } from '../../utils/recipients';
+import { withDocumentDraftMutationGuard } from '../document/with-document-draft-mutation-guard';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 
 export interface DeleteDocumentFieldOptions {
   userId: number;
   teamId: number;
   fieldId: number;
+  envelopeId?: string;
   requestMetadata: ApiRequestMetadata;
+  requireDraftStatus?: boolean;
 }
 
 export const deleteDocumentField = async ({
   userId,
   teamId,
   fieldId,
+  envelopeId,
   requestMetadata,
+  requireDraftStatus = false,
 }: DeleteDocumentFieldOptions) => {
   // Unauthenticated check, we do the real check later.
   const field = await prisma.field.findFirst({
     where: {
       id: fieldId,
+      envelopeId,
     },
   });
 
@@ -65,9 +72,23 @@ export const deleteDocumentField = async ({
     });
   }
 
+  if (isBizBuddyExternalId(envelope.externalId)) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Correlated document fields are immutable after creation',
+    });
+  }
+
   if (envelope.completedAt) {
     throw new AppError(AppErrorCode.INVALID_REQUEST, {
       message: 'Document already complete',
+    });
+  }
+
+  const mustBeDraft = requireDraftStatus;
+
+  if (mustBeDraft && envelope.status !== DocumentStatus.DRAFT) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Document is no longer a draft',
     });
   }
 
@@ -87,28 +108,43 @@ export const deleteDocumentField = async ({
   }
 
   return await prisma.$transaction(async (tx) => {
-    const deletedField = await tx.field.delete({
-      where: {
-        id: fieldId,
-        envelopeId: envelope.id,
-      },
-    });
-
-    // Handle field deleted audit log.
-    await tx.documentAuditLog.create({
-      data: createDocumentAuditLogData({
-        type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_DELETED,
-        envelopeId: envelope.id,
-        metadata: requestMetadata,
-        data: {
-          fieldId: deletedField.secondaryId,
-          fieldRecipientEmail: recipient.email,
-          fieldRecipientId: deletedField.recipientId,
-          fieldType: deletedField.type,
+    const deleteField = async () => {
+      const deletedField = await tx.field.delete({
+        where: {
+          id: fieldId,
+          envelopeId: envelope.id,
         },
-      }),
-    });
+      });
 
-    return deletedField;
+      // Handle field deleted audit log.
+      await tx.documentAuditLog.create({
+        data: createDocumentAuditLogData({
+          type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_DELETED,
+          envelopeId: envelope.id,
+          metadata: requestMetadata,
+          data: {
+            fieldId: deletedField.secondaryId,
+            fieldRecipientEmail: recipient.email,
+            fieldRecipientId: deletedField.recipientId,
+            fieldType: deletedField.type,
+          },
+        }),
+      });
+
+      return deletedField;
+    };
+
+    if (mustBeDraft) {
+      return withDocumentDraftMutationGuard(
+        {
+          tx,
+          envelopeId: envelope.id,
+          teamId,
+        },
+        deleteField,
+      );
+    }
+
+    return deleteField();
   });
 };

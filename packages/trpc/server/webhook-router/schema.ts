@@ -1,14 +1,10 @@
 import { WebhookTriggerEvents } from '@prisma/client';
 import { z } from 'zod';
 
-import { isPrivateUrl } from '@documenso/lib/server-only/webhooks/is-private-url';
-
-export const ZWebhookUrlSchema = z
-  .string()
-  .url()
-  .refine((url) => !isPrivateUrl(url), {
-    message: 'Webhook URL cannot point to a private or loopback address',
-  });
+// Registration services apply the asynchronous DNS-aware SSRF policy. Keeping
+// this schema syntactic prevents a legacy synchronous check from blocking an
+// explicitly configured exact development bypass before that policy can run.
+export const ZWebhookUrlSchema = z.string().url();
 
 export const ZCreateWebhookRequestSchema = z.object({
   webhookUrl: ZWebhookUrlSchema,

@@ -24,6 +24,7 @@ import {
 } from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
 import { mapFieldToLegacyField } from '../../utils/fields';
@@ -78,6 +79,12 @@ export const setFieldsForDocument = async ({
   if (envelope.completedAt) {
     throw new AppError(AppErrorCode.INVALID_REQUEST, {
       message: 'Document already complete',
+    });
+  }
+
+  if (isBizBuddyExternalId(envelope.externalId)) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Correlated document fields are immutable after creation',
     });
   }
 
@@ -138,7 +145,7 @@ export const setFieldsForDocument = async ({
   });
 
   const persistedFields = await prisma.$transaction(async (tx) => {
-    return await Promise.all(
+    const persisted = await Promise.all(
       linkedFields.map(async (field) => {
         const fieldSignerEmail = field._recipient.email.toLowerCase();
 
@@ -313,10 +320,8 @@ export const setFieldsForDocument = async ({
         };
       }),
     );
-  });
 
-  if (removedFields.length > 0) {
-    await prisma.$transaction(async (tx) => {
+    if (removedFields.length > 0) {
       await tx.field.deleteMany({
         where: {
           id: {
@@ -340,8 +345,10 @@ export const setFieldsForDocument = async ({
           }),
         ),
       });
-    });
-  }
+    }
+
+    return persisted;
+  });
 
   // Filter out fields that have been removed or have been updated.
   const mappedFilteredFields = existingFields

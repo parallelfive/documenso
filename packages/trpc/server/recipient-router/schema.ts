@@ -9,6 +9,7 @@ import {
   ZRecipientActionAuthTypesSchema,
 } from '@documenso/lib/types/document-auth';
 import { ZRecipientLiteSchema, ZRecipientSchema } from '@documenso/lib/types/recipient';
+import { ZRejectionReasonSchema } from '@documenso/lib/types/rejection-reason';
 import { zEmail } from '@documenso/lib/utils/zod';
 
 export const ZGetRecipientRequestSchema = z.object({
@@ -184,7 +185,7 @@ export type TCompleteDocumentWithTokenMutationSchema = z.infer<
 export const ZRejectDocumentWithTokenMutationSchema = z.object({
   token: z.string(),
   documentId: z.number(),
-  reason: z.string(),
+  reason: ZRejectionReasonSchema,
   authOptions: ZRecipientActionAuthSchema.optional(),
 });
 

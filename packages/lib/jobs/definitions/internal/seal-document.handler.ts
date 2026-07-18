@@ -33,10 +33,7 @@ import {
   DOCUMENT_AUDIT_LOG_TYPE,
   type TDocumentAuditLog,
 } from '../../../types/document-audit-logs';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../../types/webhook-payload';
 import { prefixedId } from '../../../universal/id';
 import { getFileServerSide } from '../../../universal/upload/get-file.server';
 import { putPdfFileServerSide } from '../../../universal/upload/put-file.server';
@@ -347,7 +344,7 @@ export const run = async ({
     event: isRejected
       ? WebhookTriggerEvents.DOCUMENT_REJECTED
       : WebhookTriggerEvents.DOCUMENT_COMPLETED,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(updatedEnvelope)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(updatedEnvelope),
     userId: updatedEnvelope.userId,
     teamId: updatedEnvelope.teamId ?? undefined,
   });

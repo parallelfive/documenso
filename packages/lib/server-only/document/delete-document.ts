@@ -9,18 +9,16 @@ import DocumentCancelTemplate from '@documenso/email/templates/document-cancel';
 import { prisma } from '@documenso/prisma';
 
 import { getI18nInstance } from '../../client-only/providers/i18n-server';
-import { NEXT_PUBLIC_WEBAPP_URL } from '../../constants/app';
+import { NEXT_PUBLIC_WEBAPP_URL, isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { DOCUMENT_AUDIT_LOG_TYPE } from '../../types/document-audit-logs';
 import { extractDerivedDocumentEmailSettings } from '../../types/document-email';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import type { ApiRequestMetadata } from '../../universal/extract-request-metadata';
 import { isDocumentCompleted } from '../../utils/document';
 import { createDocumentAuditLogData } from '../../utils/document-audit-logs';
 import { type EnvelopeIdOptions, unsafeBuildEnvelopeIdQuery } from '../../utils/envelope';
+import { logger } from '../../utils/logger';
 import { isRecipientEmailValidForSending } from '../../utils/recipients';
 import { renderEmailWithI18N } from '../../utils/render-email-with-i18n';
 import { getEmailContext } from '../email/get-email-context';
@@ -32,6 +30,11 @@ export type DeleteDocumentOptions = {
   userId: number;
   teamId: number;
   requestMetadata: ApiRequestMetadata;
+  /**
+   * API V1 cancellation is a legal-state transition, not the native UI's
+   * delete/hide operation. It may hard-delete only a draft or pending envelope.
+   */
+  requireCancellableStatus?: boolean;
 };
 
 export const deleteDocument = async ({
@@ -39,6 +42,7 @@ export const deleteDocument = async ({
   userId,
   teamId,
   requestMetadata,
+  requireCancellableStatus = false,
 }: DeleteDocumentOptions) => {
   const user = await prisma.user.findUnique({
     where: {
@@ -67,6 +71,11 @@ export const deleteDocument = async ({
     });
   }
 
+  // Correlated documents must retain API V1 cancellation semantics even when
+  // reached through a native Documenso route that does not opt into them.
+  const enforceCancellableStatus =
+    requireCancellableStatus || isBizBuddyExternalId(envelope.externalId);
+
   const isUserTeamMember = await getMemberRoles({
     teamId: envelope.teamId,
     reference: {
@@ -92,11 +101,12 @@ export const deleteDocument = async ({
       envelope,
       user,
       requestMetadata,
+      requireCancellableStatus: enforceCancellableStatus,
     });
 
     await triggerWebhook({
       event: WebhookTriggerEvents.DOCUMENT_CANCELLED,
-      data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(envelope)),
+      data: () => mapEnvelopeToWebhookDocumentPayload(envelope),
       userId,
       teamId,
     });
@@ -129,13 +139,25 @@ type HandleDocumentOwnerDeleteOptions = {
   };
   user: User;
   requestMetadata: ApiRequestMetadata;
+  requireCancellableStatus: boolean;
 };
 
 const handleDocumentOwnerDelete = async ({
   envelope,
   user,
   requestMetadata,
+  requireCancellableStatus,
 }: HandleDocumentOwnerDeleteOptions) => {
+  if (
+    requireCancellableStatus &&
+    envelope.status !== DocumentStatus.DRAFT &&
+    envelope.status !== DocumentStatus.PENDING
+  ) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Document can no longer be cancelled',
+    });
+  }
+
   if (envelope.deletedAt) {
     return;
   }
@@ -175,29 +197,51 @@ const handleDocumentOwnerDelete = async ({
   }
 
   // Hard delete draft and pending documents.
-  const deletedEnvelope = await prisma.$transaction(async (tx) => {
-    // Currently redundant since deleting a document will delete the audit logs.
-    // However may be useful if we disassociate audit logs and documents if required.
-    await tx.documentAuditLog.create({
-      data: createDocumentAuditLogData({
-        envelopeId: envelope.id,
-        type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_DELETED,
-        metadata: requestMetadata,
-        data: {
-          type: 'HARD',
-        },
-      }),
-    });
+  let deletedEnvelope: Envelope;
 
-    return await tx.envelope.delete({
-      where: {
-        id: envelope.id,
-        status: {
-          not: DocumentStatus.COMPLETED,
+  try {
+    deletedEnvelope = await prisma.$transaction(async (tx) => {
+      // Currently redundant since deleting a document will delete the audit logs.
+      // However may be useful if we disassociate audit logs and documents if required.
+      await tx.documentAuditLog.create({
+        data: createDocumentAuditLogData({
+          envelopeId: envelope.id,
+          type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_DELETED,
+          metadata: requestMetadata,
+          data: {
+            type: 'HARD',
+          },
+        }),
+      });
+
+      return await tx.envelope.delete({
+        where: {
+          id: envelope.id,
+          status: requireCancellableStatus
+            ? {
+                in: [DocumentStatus.DRAFT, DocumentStatus.PENDING],
+              }
+            : {
+                not: DocumentStatus.COMPLETED,
+              },
         },
-      },
+      });
     });
-  });
+  } catch (error) {
+    if (
+      requireCancellableStatus &&
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      error.code === 'P2025'
+    ) {
+      throw new AppError(AppErrorCode.CONFLICT, {
+        message: 'Document can no longer be cancelled',
+      });
+    }
+
+    throw error;
+  }
 
   const isEnvelopeDeleteEmailEnabled = extractDerivedDocumentEmailSettings(
     envelope.documentMeta,
@@ -207,8 +251,10 @@ const handleDocumentOwnerDelete = async ({
     return deletedEnvelope;
   }
 
-  // Send cancellation emails to recipients.
-  await Promise.all(
+  // The delete is already committed. Attempt every cancellation email, report
+  // aggregate failures without exposing recipient identity, and never convert
+  // the successful deletion into a false API failure/retry.
+  const emailResults = await Promise.allSettled(
     envelope.recipients.map(async (recipient) => {
       if (recipient.sendStatus !== SendStatus.SENT || !isRecipientEmailValidForSending(recipient)) {
         return;
@@ -247,6 +293,16 @@ const handleDocumentOwnerDelete = async ({
       });
     }),
   );
+
+  const failedEmailCount = emailResults.filter((result) => result.status === 'rejected').length;
+  if (failedEmailCount > 0) {
+    logger.error({
+      event: 'document-delete-cancellation-email-failed',
+      envelopeId: envelope.id,
+      failedEmailCount,
+      attemptedEmailCount: emailResults.length,
+    });
+  }
 
   return deletedEnvelope;
 };

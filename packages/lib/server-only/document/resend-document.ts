@@ -1,7 +1,9 @@
 import { createElement } from 'react';
 
 import { msg } from '@lingui/core/macro';
+import type { DocumentMeta, Envelope, Recipient } from '@prisma/client';
 import {
+  DocumentSigningOrder,
   DocumentStatus,
   EnvelopeType,
   OrganisationType,
@@ -24,14 +26,17 @@ import { renderCustomEmailTemplate } from '@documenso/lib/utils/render-custom-em
 import { prisma } from '@documenso/prisma';
 
 import { getI18nInstance } from '../../client-only/providers/i18n-server';
-import { NEXT_PUBLIC_WEBAPP_URL, SIGNING_LINK_BASE_URL } from '../../constants/app';
-import { extractDerivedDocumentEmailSettings } from '../../types/document-email';
 import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+  NEXT_PUBLIC_WEBAPP_URL,
+  buildRecipientSigningLink,
+  isBizBuddyExternalId,
+} from '../../constants/app';
+import { AppError, AppErrorCode } from '../../errors/app-error';
+import { extractDerivedDocumentEmailSettings } from '../../types/document-email';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import { isDocumentCompleted } from '../../utils/document';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
+import { logger } from '../../utils/logger';
 import { isRecipientEmailValidForSending } from '../../utils/recipients';
 import { renderEmailWithI18N } from '../../utils/render-email-with-i18n';
 import { getEmailContext } from '../email/get-email-context';
@@ -44,6 +49,53 @@ export type ResendDocumentOptions = {
   recipients: number[];
   teamId: number;
   requestMetadata: ApiRequestMetadata;
+  requireCurrentSigningOrder?: boolean;
+};
+
+type ReminderEligibilityEnvelope = Pick<Envelope, 'status'> & {
+  documentMeta: Pick<DocumentMeta, 'signingOrder'>;
+  recipients: Array<Pick<Recipient, 'id' | 'role' | 'signingOrder' | 'signingStatus'>>;
+};
+
+/**
+ * V1 reminders preserve the dispatch order contract. Sequential envelopes may
+ * remind only their current lowest-order actionable recipient; parallel
+ * envelopes may remind any exact, unsigned non-CC recipient.
+ */
+export const assertV1ReminderRecipientsEligible = (
+  envelope: ReminderEligibilityEnvelope,
+  requestedRecipientIds: number[],
+) => {
+  const uniqueRequestedRecipientIds = [...new Set(requestedRecipientIds)];
+  const actionableRecipients = envelope.recipients
+    .filter(
+      (recipient) =>
+        recipient.signingStatus === SigningStatus.NOT_SIGNED && recipient.role !== RecipientRole.CC,
+    )
+    .sort(
+      (left, right) =>
+        (left.signingOrder ?? Number.MAX_SAFE_INTEGER) -
+          (right.signingOrder ?? Number.MAX_SAFE_INTEGER) || left.id - right.id,
+    );
+
+  const hasInvalidRequest =
+    uniqueRequestedRecipientIds.length === 0 ||
+    uniqueRequestedRecipientIds.length !== requestedRecipientIds.length;
+
+  const isEligible =
+    !hasInvalidRequest &&
+    (envelope.documentMeta.signingOrder === DocumentSigningOrder.SEQUENTIAL
+      ? uniqueRequestedRecipientIds.length === 1 &&
+        uniqueRequestedRecipientIds[0] === actionableRecipients[0]?.id
+      : uniqueRequestedRecipientIds.every((recipientId) =>
+          actionableRecipients.some((recipient) => recipient.id === recipientId),
+        ));
+
+  if (!isEligible) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Recipient is not currently eligible for a reminder',
+    });
+  }
 };
 
 export const resendDocument = async ({
@@ -52,6 +104,7 @@ export const resendDocument = async ({
   recipients,
   teamId,
   requestMetadata,
+  requireCurrentSigningOrder = false,
 }: ResendDocumentOptions) => {
   const user = await prisma.user.findFirstOrThrow({
     where: {
@@ -89,6 +142,12 @@ export const resendDocument = async ({
     throw new Error('Document not found');
   }
 
+  // Correlated documents must retain API V1 reminder ordering and the final
+  // cancellation recheck even when a native Documenso route invokes the shared
+  // service without explicitly opting into those guarantees.
+  const enforceCurrentSigningOrder =
+    requireCurrentSigningOrder || isBizBuddyExternalId(envelope.externalId);
+
   if (envelope.recipients.length === 0) {
     throw new Error('Document has no recipients');
   }
@@ -99,6 +158,10 @@ export const resendDocument = async ({
 
   if (isDocumentCompleted(envelope.status)) {
     throw new Error('Can not send completed document');
+  }
+
+  if (enforceCurrentSigningOrder) {
+    assertV1ReminderRecipientsEligible(envelope, recipients);
   }
 
   // Refresh the expiresAt on each resent recipient.
@@ -189,7 +252,10 @@ export const resendDocument = async ({
       };
 
       const assetBaseUrl = NEXT_PUBLIC_WEBAPP_URL() || 'http://localhost:3000';
-      const signDocumentLink = `${SIGNING_LINK_BASE_URL()}/sign/${recipient.token}`;
+      const signDocumentLink = buildRecipientSigningLink({
+        externalId: envelope.externalId,
+        recipientToken: recipient.token,
+      });
 
       const template = createElement(DocumentInviteEmailTemplate, {
         documentName: envelope.title,
@@ -219,6 +285,27 @@ export const resendDocument = async ({
         }),
       ]);
 
+      // Linearization point for V1 reminder/cancellation overlap. Rendering is
+      // side-effect free; the last database observation happens immediately
+      // before transport so a cancellation that committed first sends no mail.
+      if (enforceCurrentSigningOrder) {
+        const latestEnvelope = await prisma.envelope.findUnique({
+          where: envelopeWhereInput,
+          include: {
+            recipients: true,
+            documentMeta: true,
+          },
+        });
+
+        if (!latestEnvelope || latestEnvelope.status !== DocumentStatus.PENDING) {
+          throw new AppError(AppErrorCode.CONFLICT, {
+            message: 'Document is no longer eligible for a reminder',
+          });
+        }
+
+        assertV1ReminderRecipientsEligible(latestEnvelope, recipients);
+      }
+
       // Send email outside any transaction to avoid holding a connection
       // open during network I/O.
       await mailer.sendMail({
@@ -238,27 +325,38 @@ export const resendDocument = async ({
         text,
       });
 
-      await prisma.documentAuditLog.create({
-        data: createDocumentAuditLogData({
-          type: DOCUMENT_AUDIT_LOG_TYPE.EMAIL_SENT,
+      try {
+        await prisma.documentAuditLog.create({
+          data: createDocumentAuditLogData({
+            type: DOCUMENT_AUDIT_LOG_TYPE.EMAIL_SENT,
+            envelopeId: envelope.id,
+            metadata: requestMetadata,
+            data: {
+              emailType: recipientEmailType,
+              recipientEmail: recipient.email,
+              recipientName: recipient.name,
+              recipientRole: recipient.role,
+              recipientId: recipient.id,
+              isResending: true,
+            },
+          }),
+        });
+      } catch (error) {
+        // Delivery has already succeeded. Never return a false failure that
+        // invites a duplicate manual resend; audit repair is operational work.
+        logger.error({
+          event: 'document-reminder-email-audit-failed',
           envelopeId: envelope.id,
-          metadata: requestMetadata,
-          data: {
-            emailType: recipientEmailType,
-            recipientEmail: recipient.email,
-            recipientName: recipient.name,
-            recipientRole: recipient.role,
-            recipientId: recipient.id,
-            isResending: true,
-          },
-        }),
-      });
+          recipientId: recipient.id,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+        });
+      }
     }),
   );
 
   await triggerWebhook({
     event: WebhookTriggerEvents.DOCUMENT_REMINDER_SENT,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(envelope)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(envelope),
     userId: envelope.userId,
     teamId: envelope.teamId,
   });

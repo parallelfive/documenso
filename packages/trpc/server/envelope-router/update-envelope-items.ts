@@ -1,5 +1,6 @@
 import { AppError, AppErrorCode } from '@documenso/lib/errors/app-error';
 import { UNSAFE_updateEnvelopeItems } from '@documenso/lib/server-only/envelope-item/update-envelope-items';
+import { assertCorrelatedDocumentContentImmutable } from '@documenso/lib/server-only/envelope/assert-correlated-document-content-immutable';
 import { getEnvelopeWhereInput } from '@documenso/lib/server-only/envelope/get-envelope-by-id';
 import { getEnvelopeItemPermissions } from '@documenso/lib/utils/envelope';
 import { prisma } from '@documenso/prisma';
@@ -48,6 +49,8 @@ export const updateEnvelopeItemsRoute = authenticatedProcedure
         message: 'Envelope not found',
       });
     }
+
+    assertCorrelatedDocumentContentImmutable(envelope);
 
     if (data.length === 0) {
       throw new AppError(AppErrorCode.INVALID_BODY, {

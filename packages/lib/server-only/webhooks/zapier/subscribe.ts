@@ -12,11 +12,17 @@ export const subscribeHandler = async (req: Request) => {
       return new Response('Unauthorized', { status: 401 });
     }
 
+    let result: Awaited<ReturnType<typeof validateApiToken>>;
+
+    try {
+      result = await validateApiToken({ authorization });
+    } catch {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
     const { webhookUrl, eventTrigger } = await req.json();
 
     await assertNotPrivateUrl(webhookUrl);
-
-    const result = await validateApiToken({ authorization });
 
     const createdWebhook = await prisma.webhook.create({
       data: {

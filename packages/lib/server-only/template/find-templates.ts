@@ -16,6 +16,33 @@ export type FindTemplatesOptions = {
   folderId?: string;
 };
 
+export const buildFindTemplatesWhere = ({
+  userId,
+  teamId,
+  teamRole,
+  type,
+  folderId,
+}: FindTemplatesOptions & {
+  teamRole: keyof typeof TEAM_DOCUMENT_VISIBILITY_MAP;
+}): Prisma.EnvelopeWhereInput => ({
+  type: EnvelopeType.TEMPLATE,
+  templateType: type,
+  AND: [
+    { teamId },
+    {
+      OR: [
+        {
+          visibility: {
+            in: TEAM_DOCUMENT_VISIBILITY_MAP[teamRole],
+          },
+        },
+        { userId, teamId },
+      ],
+    },
+    folderId ? { folderId } : { folderId: null },
+  ],
+});
+
 export const findTemplates = async ({
   userId,
   teamId,
@@ -32,24 +59,13 @@ export const findTemplates = async ({
     },
   });
 
-  const where: Prisma.EnvelopeWhereInput = {
-    type: EnvelopeType.TEMPLATE,
-    templateType: type,
-    AND: [
-      { teamId },
-      {
-        OR: [
-          {
-            visibility: {
-              in: TEAM_DOCUMENT_VISIBILITY_MAP[teamRole],
-            },
-          },
-          { userId, teamId },
-        ],
-      },
-      folderId ? { folderId } : { folderId: null },
-    ],
-  };
+  const where = buildFindTemplatesWhere({
+    userId,
+    teamId,
+    teamRole,
+    type,
+    folderId,
+  });
 
   const templateInclude = {
     team: {

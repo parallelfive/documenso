@@ -12,7 +12,9 @@ import {
 import { TemplateType } from '@prisma/client';
 import { z } from 'zod';
 
+import { isBizBuddyExternalId, isValidBizBuddyExternalId } from '@documenso/lib/constants/app';
 import { DATE_FORMATS, DEFAULT_DOCUMENT_DATE_FORMAT } from '@documenso/lib/constants/date-formats';
+import { ZEnvelopeExpirationPeriod } from '@documenso/lib/constants/envelope-expiration';
 import { SUPPORTED_LANGUAGE_CODES } from '@documenso/lib/constants/i18n';
 import { DEFAULT_DOCUMENT_TIME_ZONE, TIME_ZONES } from '@documenso/lib/constants/time-zones';
 import { ZUrlSchema } from '@documenso/lib/schemas/common';
@@ -22,13 +24,21 @@ import {
   ZRecipientActionAuthTypesSchema,
 } from '@documenso/lib/types/document-auth';
 import { ZDocumentEmailSettingsSchema } from '@documenso/lib/types/document-email';
+import { ZExpectedDocumentExecutionSchema } from '@documenso/lib/types/document-execution';
+import {
+  MAX_BIZBUDDY_ENVELOPE_RECIPIENTS,
+  ZExecutionRecipientIdentitySchema,
+} from '@documenso/lib/types/document-execution-profile';
 import { ZEnvelopeAttachmentTypeSchema } from '@documenso/lib/types/envelope-attachment';
 import { ZFieldMetaPrefillFieldsSchema, ZFieldMetaSchema } from '@documenso/lib/types/field-meta';
+import { ZRejectionReasonSchema } from '@documenso/lib/types/rejection-reason';
 import { zEmail } from '@documenso/lib/utils/zod';
 
 extendZodWithOpenApi(z);
 
 export const ZNoBodyMutationSchema = null;
+
+const ZPositiveApiTeamIdSchema = z.number().int().positive();
 
 /**
  * Documents
@@ -52,7 +62,7 @@ export const ZSuccessfulDocumentResponseSchema = z.object({
   id: z.number(),
   externalId: z.string().nullish(),
   userId: z.number(),
-  teamId: z.number().nullish(),
+  teamId: ZPositiveApiTeamIdSchema,
   folderId: z.string().nullish(),
   title: z.string(),
   status: z.string(),
@@ -62,7 +72,14 @@ export const ZSuccessfulDocumentResponseSchema = z.object({
 });
 
 export const ZSuccessfulGetDocumentResponseSchema = ZSuccessfulDocumentResponseSchema.extend({
-  recipients: z.lazy(() => z.array(ZSuccessfulRecipientResponseSchema)),
+  signingOrder: z.nativeEnum(DocumentSigningOrder),
+  recipients: z.lazy(() =>
+    z.array(
+      ZSuccessfulRecipientResponseSchema.extend({
+        rejectionReason: ZRejectionReasonSchema.nullable(),
+      }),
+    ),
+  ),
   fields: z.lazy(() =>
     ZFieldSchema.pick({
       id: true,
@@ -100,8 +117,9 @@ export const ZSendDocumentForSigningMutationSchema = z
       description:
         'Whether to send completion emails when the document is fully signed. This will override the document email settings.',
     }),
+    expectedExecution: ZExpectedDocumentExecutionSchema.optional(),
   })
-  .or(z.any().transform(() => ({ sendEmail: true, sendCompletionEmails: undefined })));
+  .strict();
 
 export type TSendDocumentForSigningMutationSchema = typeof ZSendDocumentForSigningMutationSchema;
 
@@ -139,87 +157,181 @@ export const ZDownloadDocumentSuccessfulSchema = z.object({
 
 export type TUploadDocumentSuccessfulSchema = z.infer<typeof ZUploadDocumentSuccessfulSchema>;
 
-export const ZCreateDocumentMutationSchema = z.object({
-  title: z.string().min(1),
-  externalId: z.string().nullish(),
-  folderId: z
-    .string()
-    .describe(
-      'The ID of the folder to create the document in. If not provided, the document will be created in the root folder.',
-    )
-    .optional(),
-  recipients: z.array(
-    z.object({
-      name: z.string().min(1),
-      email: zEmail().min(1),
-      role: z.nativeEnum(RecipientRole).optional().default(RecipientRole.SIGNER),
-      signingOrder: z.number().nullish(),
-    }),
-  ),
-  meta: z
-    .object({
-      subject: z.string(),
-      message: z.string(),
-      timezone: z.string().default(DEFAULT_DOCUMENT_TIME_ZONE).openapi({
-        description:
-          'The timezone of the date. Must be one of the options listed in the list below.',
-        enum: TIME_ZONES,
-      }),
-      dateFormat: z
-        .string()
-        .default(DEFAULT_DOCUMENT_DATE_FORMAT)
-        .openapi({
-          description:
-            'The format of the date. Must be one of the options listed in the list below.',
-          enum: DATE_FORMATS.map((format) => format.value),
-        }),
-      redirectUrl: z.string(),
-      signingOrder: z.nativeEnum(DocumentSigningOrder).optional(),
-      allowDictateNextSigner: z.boolean().optional(),
-      language: z.enum(SUPPORTED_LANGUAGE_CODES).optional(),
-      typedSignatureEnabled: z.boolean().optional().default(true),
-      uploadSignatureEnabled: z.boolean().optional().default(true),
-      drawSignatureEnabled: z.boolean().optional().default(true),
-      distributionMethod: z.nativeEnum(DocumentDistributionMethod).optional(),
-      emailSettings: ZDocumentEmailSettingsSchema.optional(),
-    })
-    .partial()
-    .optional()
-    .default({}),
-  authOptions: z
-    .object({
-      globalAccessAuth: z
-        .union([ZDocumentAccessAuthTypesSchema, z.array(ZDocumentAccessAuthTypesSchema)])
-        .transform((val) => (Array.isArray(val) ? val : [val]))
-        .optional()
-        .default([]),
-      globalActionAuth: z
-        .union([ZDocumentActionAuthTypesSchema, z.array(ZDocumentActionAuthTypesSchema)])
-        .transform((val) => (Array.isArray(val) ? val : [val]))
-        .optional()
-        .default([]),
-    })
-    .optional()
-    .openapi({
-      description: 'The globalActionAuth property is only available for Enterprise accounts.',
-    }),
-  formValues: z.record(z.string(), z.union([z.string(), z.boolean(), z.number()])).optional(),
-  attachments: z
-    .array(
+export const ZCreateDocumentMutationSchema = z
+  .object({
+    title: z.string().min(1),
+    externalId: z.string().nullish(),
+    folderId: z
+      .string()
+      .describe(
+        'The ID of the folder to create the document in. If not provided, the document will be created in the root folder.',
+      )
+      .optional(),
+    recipients: z.array(
       z.object({
-        label: z.string().min(1, 'Label is required'),
-        data: z.string().url('Must be a valid URL'),
-        type: ZEnvelopeAttachmentTypeSchema.optional().default('link'),
+        name: z.string().min(1),
+        email: zEmail().min(1),
+        role: z.nativeEnum(RecipientRole).optional().default(RecipientRole.SIGNER),
+        signingOrder: z.number().nullish(),
       }),
-    )
-    .optional(),
-});
+    ),
+    meta: z
+      .object({
+        subject: z.string(),
+        message: z.string(),
+        timezone: z.string().default(DEFAULT_DOCUMENT_TIME_ZONE).openapi({
+          description:
+            'The timezone of the date. Must be one of the options listed in the list below.',
+          enum: TIME_ZONES,
+        }),
+        dateFormat: z
+          .string()
+          .default(DEFAULT_DOCUMENT_DATE_FORMAT)
+          .openapi({
+            description:
+              'The format of the date. Must be one of the options listed in the list below.',
+            enum: DATE_FORMATS.map((format) => format.value),
+          }),
+        redirectUrl: z.string(),
+        signingOrder: z.nativeEnum(DocumentSigningOrder).optional(),
+        allowDictateNextSigner: z.boolean().optional(),
+        language: z.enum(SUPPORTED_LANGUAGE_CODES).optional(),
+        typedSignatureEnabled: z.boolean().optional().default(true),
+        uploadSignatureEnabled: z.boolean().optional().default(true),
+        drawSignatureEnabled: z.boolean().optional().default(true),
+        distributionMethod: z.nativeEnum(DocumentDistributionMethod).optional(),
+        emailSettings: ZDocumentEmailSettingsSchema.optional(),
+        envelopeExpirationPeriod: ZEnvelopeExpirationPeriod.optional(),
+      })
+      .partial()
+      .optional()
+      .default({}),
+    authOptions: z
+      .object({
+        globalAccessAuth: z
+          .union([ZDocumentAccessAuthTypesSchema, z.array(ZDocumentAccessAuthTypesSchema)])
+          .transform((val) => (Array.isArray(val) ? val : [val]))
+          .optional()
+          .default([]),
+        globalActionAuth: z
+          .union([ZDocumentActionAuthTypesSchema, z.array(ZDocumentActionAuthTypesSchema)])
+          .transform((val) => (Array.isArray(val) ? val : [val]))
+          .optional()
+          .default([]),
+      })
+      .optional()
+      .openapi({
+        description: 'The globalActionAuth property is only available for Enterprise accounts.',
+      }),
+    formValues: z.record(z.string(), z.union([z.string(), z.boolean(), z.number()])).optional(),
+    attachments: z
+      .array(
+        z.object({
+          label: z.string().min(1, 'Label is required'),
+          data: z.string().url('Must be a valid URL'),
+          type: ZEnvelopeAttachmentTypeSchema.optional().default('link'),
+        }),
+      )
+      .optional(),
+  })
+  .superRefine(
+    ({ externalId, attachments, authOptions, formValues, meta, recipients }, context) => {
+      if (!isBizBuddyExternalId(externalId)) return;
+
+      if (!isValidBizBuddyExternalId(externalId)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['externalId'],
+          message: 'Biz Buddy external IDs must use the canonical bizbuddy:<UUID> format',
+        });
+      }
+
+      if (attachments && attachments.length > 0) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['attachments'],
+          message: 'Correlated documents do not support attachments',
+        });
+      }
+
+      if (
+        (authOptions?.globalAccessAuth.length ?? 0) > 0 ||
+        (authOptions?.globalActionAuth.length ?? 0) > 0
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['authOptions'],
+          message: 'Correlated documents do not support document authentication',
+        });
+      }
+
+      if (formValues !== undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['formValues'],
+          message: 'Correlated documents do not support form values',
+        });
+      }
+
+      if (meta.allowDictateNextSigner === true) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['meta', 'allowDictateNextSigner'],
+          message: 'Correlated documents do not allow signers to replace recipient identity',
+        });
+      }
+
+      if (recipients.length < 1 || recipients.length > MAX_BIZBUDDY_ENVELOPE_RECIPIENTS) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['recipients'],
+          message: `Correlated documents require between 1 and ${MAX_BIZBUDDY_ENVELOPE_RECIPIENTS} recipients`,
+        });
+      }
+
+      recipients.forEach((recipient, index) => {
+        if (
+          !ZExecutionRecipientIdentitySchema.safeParse({
+            name: recipient.name,
+            email: recipient.email,
+          }).success
+        ) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['recipients', index],
+            message: 'Correlated document recipient identity is not representable',
+          });
+        }
+
+        if (recipient.role !== RecipientRole.SIGNER) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['recipients', index, 'role'],
+            message: 'Correlated document recipients must be signers',
+          });
+        }
+
+        if (
+          recipient.signingOrder !== null &&
+          recipient.signingOrder !== undefined &&
+          (!Number.isSafeInteger(recipient.signingOrder) || recipient.signingOrder <= 0)
+        ) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['recipients', index, 'signingOrder'],
+            message: 'Correlated document signing orders must be positive integers',
+          });
+        }
+      });
+    },
+  );
 
 export type TCreateDocumentMutationSchema = z.infer<typeof ZCreateDocumentMutationSchema>;
 
 export const ZCreateDocumentMutationResponseSchema = z.object({
   uploadUrl: z.string().min(1),
   documentId: z.number(),
+  teamId: ZPositiveApiTeamIdSchema,
   externalId: z.string().nullish(),
   recipients: z.array(
     z.object({
@@ -500,7 +612,7 @@ const ZSuccessfulFieldSchema = z.object({
 });
 
 export const ZSuccessfulFieldCreationResponseSchema = z.object({
-  fields: z.union([ZSuccessfulFieldSchema, z.array(ZSuccessfulFieldSchema)]),
+  fields: z.array(ZSuccessfulFieldSchema).min(1),
   documentId: z.number(),
 });
 
@@ -521,10 +633,23 @@ export const ZSuccessfulFieldResponseSchema = z.object({
 
 export type TSuccessfulFieldResponseSchema = z.infer<typeof ZSuccessfulFieldResponseSchema>;
 
-export const ZSuccessfulResponseSchema = z.object({
-  documents: ZSuccessfulDocumentResponseSchema.array(),
-  totalPages: z.number(),
-});
+export const ZSuccessfulResponseSchema = z
+  .object({
+    teamId: ZPositiveApiTeamIdSchema,
+    documents: ZSuccessfulDocumentResponseSchema.array(),
+    totalPages: z.number(),
+  })
+  .superRefine(({ teamId, documents }, context) => {
+    documents.forEach((document, index) => {
+      if (document.teamId !== teamId) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Document team does not match the authenticated API team',
+          path: ['documents', index, 'teamId'],
+        });
+      }
+    });
+  });
 
 export type TSuccessfulResponseSchema = z.infer<typeof ZSuccessfulResponseSchema>;
 
@@ -532,7 +657,11 @@ export const ZSuccessfulSigningResponseSchema = z
   .object({
     message: z.string(),
   })
-  .and(ZSuccessfulGetDocumentResponseSchema.omit({ fields: true }));
+  .and(
+    ZSuccessfulDocumentResponseSchema.extend({
+      recipients: z.lazy(() => z.array(ZSuccessfulRecipientResponseSchema)),
+    }),
+  );
 
 export type TSuccessfulSigningResponseSchema = z.infer<typeof ZSuccessfulSigningResponseSchema>;
 

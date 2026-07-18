@@ -4,6 +4,7 @@ import { AppError, AppErrorCode } from '@documenso/lib/errors/app-error';
 import { prisma } from '@documenso/prisma';
 
 import { buildTeamWhereQuery } from '../../utils/teams';
+import { assertCorrelatedDocumentContentImmutable } from '../envelope/assert-correlated-document-content-immutable';
 
 export type CreateAttachmentOptions = {
   envelopeId: string;
@@ -33,6 +34,8 @@ export const createAttachment = async ({
       message: 'Envelope not found',
     });
   }
+
+  assertCorrelatedDocumentContentImmutable(envelope);
 
   if (envelope.status === DocumentStatus.COMPLETED || envelope.status === DocumentStatus.REJECTED) {
     throw new AppError(AppErrorCode.INVALID_REQUEST, {

@@ -5,6 +5,7 @@ import { prisma } from '@documenso/prisma';
 
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { DOCUMENT_AUDIT_LOG_TYPE } from '../../types/document-audit-logs';
+import { ZRejectionReasonSchema } from '../../types/rejection-reason';
 import type { RequestMetadata } from '../../universal/extract-request-metadata';
 import { createDocumentAuditLogData } from '../../utils/document-audit-logs';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
@@ -24,6 +25,8 @@ export async function rejectDocumentWithToken({
   reason,
   requestMetadata,
 }: RejectDocumentWithTokenOptions) {
+  const boundedReason = ZRejectionReasonSchema.parse(reason);
+
   // Find the recipient and document in a single query
   const recipient = await prisma.recipient.findFirst({
     where: {
@@ -60,7 +63,7 @@ export async function rejectDocumentWithToken({
       data: {
         signedAt: new Date(),
         signingStatus: SigningStatus.REJECTED,
-        rejectionReason: reason,
+        rejectionReason: boundedReason,
       },
     }),
     prisma.documentAuditLog.create({
@@ -76,7 +79,7 @@ export async function rejectDocumentWithToken({
           recipientName: recipient.name,
           recipientId: recipient.id,
           recipientRole: recipient.role,
-          reason,
+          reason: boundedReason,
         },
         requestMetadata,
       }),
@@ -108,7 +111,7 @@ export async function rejectDocumentWithToken({
     name: 'send.document.cancelled.emails',
     payload: {
       documentId: legacyDocumentId,
-      cancellationReason: reason,
+      cancellationReason: boundedReason,
       requestMetadata,
     },
   });

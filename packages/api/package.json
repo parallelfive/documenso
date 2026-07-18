@@ -5,6 +5,7 @@
   "types": "./index.ts",
   "license": "MIT",
   "scripts": {
+    "test": "vitest run",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "clean": "rimraf node_modules"
@@ -25,5 +26,8 @@
     "superjson": "^2.2.5",
     "ts-pattern": "^5.9.0",
     "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
   }
 }

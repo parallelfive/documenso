@@ -16,17 +16,14 @@ import DocumentReminderEmailTemplate from '@documenso/email/templates/document-r
 import { prisma } from '@documenso/prisma';
 
 import { getI18nInstance } from '../../../client-only/providers/i18n-server';
-import { NEXT_PUBLIC_WEBAPP_URL, SIGNING_LINK_BASE_URL } from '../../../constants/app';
+import { NEXT_PUBLIC_WEBAPP_URL, buildRecipientSigningLink } from '../../../constants/app';
 import { RECIPIENT_ROLES_DESCRIPTION } from '../../../constants/recipient-roles';
 import { getEmailContext } from '../../../server-only/email/get-email-context';
 import { updateRecipientNextReminder } from '../../../server-only/recipient/update-recipient-next-reminder';
 import { triggerWebhook } from '../../../server-only/webhooks/trigger/trigger-webhook';
 import { DOCUMENT_AUDIT_LOG_TYPE, DOCUMENT_EMAIL_TYPE } from '../../../types/document-audit-logs';
 import { extractDerivedDocumentEmailSettings } from '../../../types/document-email';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../../types/webhook-payload';
 import { createDocumentAuditLogData } from '../../../utils/document-audit-logs';
 import { renderCustomEmailTemplate } from '../../../utils/render-custom-email-template';
 import { renderEmailWithI18N } from '../../../utils/render-email-with-i18n';
@@ -155,7 +152,10 @@ export const run = async ({
     : undefined;
 
   const assetBaseUrl = NEXT_PUBLIC_WEBAPP_URL() || 'http://localhost:3000';
-  const signDocumentLink = `${SIGNING_LINK_BASE_URL()}/sign/${recipient.token}`;
+  const signDocumentLink = buildRecipientSigningLink({
+    externalId: envelope.externalId,
+    recipientToken: recipient.token,
+  });
 
   io.logger.info(
     `Sending signing reminder for envelope ${envelope.id} to recipient ${recipient.id} (${recipient.email})`,
@@ -208,7 +208,7 @@ export const run = async ({
 
   await triggerWebhook({
     event: WebhookTriggerEvents.DOCUMENT_REMINDER_SENT,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(envelope)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(envelope),
     userId: envelope.userId,
     teamId: envelope.teamId,
   });

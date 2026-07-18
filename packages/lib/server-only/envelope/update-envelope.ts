@@ -8,13 +8,11 @@ import type { CreateDocumentAuditLogDataResponse } from '@documenso/lib/utils/do
 import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import { TEAM_DOCUMENT_VISIBILITY_MAP } from '../../constants/teams';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import type { TDocumentAccessAuthTypes, TDocumentActionAuthTypes } from '../../types/document-auth';
-import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import { createDocumentAuthOptions, extractDocumentAuthMethods } from '../../utils/document-auth';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
 import { buildTeamWhereQuery, canAccessTeamDocument } from '../../utils/teams';
@@ -94,6 +92,25 @@ export const updateEnvelope = async ({
     return envelope;
   }
 
+  const isCorrelatedDocument =
+    envelope.type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(envelope.externalId);
+
+  if (!isCorrelatedDocument && isBizBuddyExternalId(data.externalId)) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'The Biz Buddy correlation namespace can only be set at document creation',
+    });
+  }
+
+  if (
+    isCorrelatedDocument &&
+    data.externalId !== undefined &&
+    data.externalId !== envelope.externalId
+  ) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Correlated document identity is immutable',
+    });
+  }
+
   const isEnvelopeOwner = envelope.userId === userId;
 
   // Validate whether the new visibility setting is allowed for the current user.
@@ -119,6 +136,37 @@ export const updateEnvelope = async ({
     data?.globalAccessAuth === undefined ? documentGlobalAccessAuth : data.globalAccessAuth;
   const newGlobalActionAuth =
     data?.globalActionAuth === undefined ? documentGlobalActionAuth : data.globalActionAuth;
+
+  if (isCorrelatedDocument) {
+    const definedMeta = Object.fromEntries(
+      Object.entries(meta).filter(([, value]) => value !== undefined),
+    );
+    const currentMeta = envelope.documentMeta ?? {};
+    const hasDataChange =
+      (data.title !== undefined && data.title !== envelope.title) ||
+      (data.folderId !== undefined && data.folderId !== envelope.folderId) ||
+      (data.externalId !== undefined && data.externalId !== envelope.externalId) ||
+      (data.visibility !== undefined && data.visibility !== envelope.visibility) ||
+      (data.globalAccessAuth !== undefined &&
+        !isDeepEqual(newGlobalAccessAuth, documentGlobalAccessAuth)) ||
+      (data.globalActionAuth !== undefined &&
+        !isDeepEqual(newGlobalActionAuth, documentGlobalActionAuth)) ||
+      (data.publicTitle !== undefined && data.publicTitle !== envelope.publicTitle) ||
+      (data.publicDescription !== undefined &&
+        data.publicDescription !== envelope.publicDescription) ||
+      (data.templateType !== undefined && data.templateType !== envelope.templateType) ||
+      (data.useLegacyFieldInsertion !== undefined &&
+        data.useLegacyFieldInsertion !== envelope.useLegacyFieldInsertion);
+    const hasMetaChange = !isDeepEqual({ ...currentMeta, ...definedMeta }, currentMeta);
+
+    if (hasDataChange || hasMetaChange) {
+      throw new AppError(AppErrorCode.CONFLICT, {
+        message: 'Correlated document execution metadata is immutable',
+      });
+    }
+
+    return envelope;
+  }
 
   // Check if user has permission to set the global action auth.
   if (newGlobalActionAuth.length > 0 && !envelope.team.organisation.organisationClaim.flags.cfr21) {
@@ -198,13 +246,6 @@ export const updateEnvelope = async ({
     isDeepEqual(documentGlobalActionAuth, newGlobalActionAuth);
   const isDocumentVisibilitySame =
     data.visibility === undefined || data.visibility === envelope.visibility;
-  const isFolderSame = data.folderId === undefined || data.folderId === envelope.folderId;
-  const isTemplateTypeSame =
-    data.templateType === undefined || data.templateType === envelope.templateType;
-  const isPublicDescriptionSame =
-    data.publicDescription === undefined || data.publicDescription === envelope.publicDescription;
-  const isPublicTitleSame =
-    data.publicTitle === undefined || data.publicTitle === envelope.publicTitle;
 
   const auditLogs: CreateDocumentAuditLogDataResponse[] = [];
 
@@ -319,40 +360,44 @@ export const updateEnvelope = async ({
   // }
 
   const updatedEnvelope = await prisma.$transaction(async (tx) => {
-    const result = await tx.envelope.update({
-      where: {
-        id: envelope.id,
-      },
-      data: {
-        title: data.title,
-        externalId: data.externalId,
-        visibility: data.visibility,
-        templateType: data.templateType,
-        publicDescription: data.publicDescription,
-        publicTitle: data.publicTitle,
-        useLegacyFieldInsertion: data.useLegacyFieldInsertion,
-        authOptions,
-        folder: folderUpdateQuery,
-        documentMeta: {
-          update: {
-            ...meta,
-            emailSettings: meta?.emailSettings || undefined,
+    const updateEnvelopeData = async () => {
+      const result = await tx.envelope.update({
+        where: {
+          id: envelope.id,
+        },
+        data: {
+          title: data.title,
+          externalId: data.externalId,
+          visibility: data.visibility,
+          templateType: data.templateType,
+          publicDescription: data.publicDescription,
+          publicTitle: data.publicTitle,
+          useLegacyFieldInsertion: data.useLegacyFieldInsertion,
+          authOptions,
+          folder: folderUpdateQuery,
+          documentMeta: {
+            update: {
+              ...meta,
+              emailSettings: meta?.emailSettings || undefined,
+            },
           },
         },
-      },
-      include: {
-        documentMeta: true,
-        recipients: true,
-      },
-    });
-
-    if (envelope.type === EnvelopeType.DOCUMENT) {
-      await tx.documentAuditLog.createMany({
-        data: auditLogs,
+        include: {
+          documentMeta: true,
+          recipients: true,
+        },
       });
-    }
 
-    return result;
+      if (envelope.type === EnvelopeType.DOCUMENT) {
+        await tx.documentAuditLog.createMany({
+          data: auditLogs,
+        });
+      }
+
+      return result;
+    };
+
+    return updateEnvelopeData();
   });
 
   // Recompute reminders for active recipients when reminder settings change.
@@ -363,7 +408,7 @@ export const updateEnvelope = async ({
   if (envelope.type === EnvelopeType.TEMPLATE) {
     await triggerWebhook({
       event: WebhookTriggerEvents.TEMPLATE_UPDATED,
-      data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(updatedEnvelope)),
+      data: () => mapEnvelopeToWebhookDocumentPayload(updatedEnvelope),
       userId,
       teamId,
     });

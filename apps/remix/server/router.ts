@@ -22,6 +22,7 @@ import { migrateDeletedAccountServiceAccount } from '@documenso/lib/server-only/
 import { migrateLegacyServiceAccount } from '@documenso/lib/server-only/user/service-accounts/legacy-service-account';
 import { env } from '@documenso/lib/utils/env';
 import { logger } from '@documenso/lib/utils/logger';
+import { redactSigningCapabilityFromPath } from '@documenso/lib/utils/redact-sensitive-path';
 import { openApiDocument } from '@documenso/trpc/server/open-api';
 
 import { aiRoute } from './api/ai/route';
@@ -82,7 +83,7 @@ app.use(async (c, next) => {
 
   const honoLogger = logger.child({
     requestId: c.var.requestId,
-    requestPath: c.req.path,
+    requestPath: redactSigningCapabilityFromPath(c.req.path),
     ipAddress: metadata.ipAddress,
     userAgent: metadata.userAgent,
   });

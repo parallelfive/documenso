@@ -1,4 +1,11 @@
-import type { DocumentData, Envelope, EnvelopeItem, Field, Recipient } from '@prisma/client';
+import type {
+  DocumentData,
+  Envelope,
+  EnvelopeItem,
+  Field,
+  Prisma,
+  Recipient,
+} from '@prisma/client';
 import {
   DocumentSigningOrder,
   DocumentStatus,
@@ -9,11 +16,16 @@ import {
   SigningStatus,
   WebhookTriggerEvents,
 } from '@prisma/client';
+import { createHash } from 'node:crypto';
 
+import { APP_DOCUMENT_UPLOAD_SIZE_LIMIT, isBizBuddyExternalId } from '@documenso/lib/constants/app';
 import { resolveExpiresAt } from '@documenso/lib/constants/envelope-expiration';
 import { DOCUMENT_AUDIT_LOG_TYPE } from '@documenso/lib/types/document-audit-logs';
 import type { ApiRequestMetadata } from '@documenso/lib/universal/extract-request-metadata';
-import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-logs';
+import {
+  createDocumentAuditLogData,
+  diffDocumentMetaChanges,
+} from '@documenso/lib/utils/document-audit-logs';
 import { prisma } from '@documenso/prisma';
 import { checkboxValidationSigns } from '@documenso/ui/primitives/document-flow/field-items-advanced-settings/constants';
 
@@ -21,7 +33,14 @@ import { validateCheckboxLength } from '../../advanced-fields-validation/validat
 import { DIRECT_TEMPLATE_RECIPIENT_EMAIL } from '../../constants/direct-templates';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { jobs } from '../../jobs/client';
-import { extractDerivedDocumentEmailSettings } from '../../types/document-email';
+import {
+  type TDocumentEmailSettings,
+  extractDerivedDocumentEmailSettings,
+} from '../../types/document-email';
+import {
+  type TExpectedDocumentExecution,
+  matchesExpectedDocumentExecution,
+} from '../../types/document-execution';
 import {
   ZCheckboxFieldMeta,
   ZDropdownFieldMeta,
@@ -30,16 +49,21 @@ import {
   ZRadioFieldMeta,
   ZTextFieldMeta,
 } from '../../types/field-meta';
+import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
+import { deleteFile } from '../../universal/upload/delete-file';
 import {
-  ZWebhookDocumentSchema,
-  mapEnvelopeToWebhookDocumentPayload,
-} from '../../types/webhook-payload';
-import { getFileServerSide } from '../../universal/upload/get-file.server';
-import { putNormalizedPdfFileServerSide } from '../../universal/upload/put-file.server';
+  FileSizeLimitExceededError,
+  getFileServerSide,
+} from '../../universal/upload/get-file.server';
+import {
+  putInternalPdfSnapshotServerSide,
+  putNormalizedPdfFileServerSide,
+} from '../../universal/upload/put-file.server';
 import { isDocumentCompleted } from '../../utils/document';
 import { extractDocumentAuthMethods } from '../../utils/document-auth';
 import { type EnvelopeIdOptions, mapSecondaryIdToDocumentId } from '../../utils/envelope';
 import { toCheckboxCustomText, toRadioCustomText } from '../../utils/fields';
+import { logger } from '../../utils/logger';
 import {
   getRecipientsWithMissingFields,
   isRecipientEmailValidForSending,
@@ -47,12 +71,29 @@ import {
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 import { insertFormValuesInPdf } from '../pdf/insert-form-values-in-pdf';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
+import { withDocumentDraftMutationGuard } from './with-document-draft-mutation-guard';
+
+const MAX_ATOMIC_EXECUTION_PDF_BYTES = Math.max(1, APP_DOCUMENT_UPLOAD_SIZE_LIMIT) * 1024 * 1024;
+const ATOMIC_EXECUTION_PDF_READ_TIMEOUT_MS = 30_000;
+
+type PreparedExecutionPdfSnapshot = {
+  sourceEnvelopeItemId: string;
+  sourceDocumentDataId: string;
+  documentData: DocumentData;
+};
 
 export type SendDocumentOptions = {
   id: EnvelopeIdOptions;
   userId: number;
   teamId: number;
   sendEmail?: boolean;
+  documentEmailSettings?: TDocumentEmailSettings;
+  expectedExecution?: TExpectedDocumentExecution;
+  /**
+   * API V1 dispatch is a one-way legal-state transition. Native callers keep
+   * their existing resend-like semantics unless they opt into this guard.
+   */
+  requireDraftStatus?: boolean;
   requestMetadata: ApiRequestMetadata;
 };
 
@@ -61,6 +102,9 @@ export const sendDocument = async ({
   userId,
   teamId,
   sendEmail,
+  documentEmailSettings,
+  expectedExecution,
+  requireDraftStatus = false,
   requestMetadata,
 }: SendDocumentOptions) => {
   const { envelopeWhereInput } = await getEnvelopeWhereInput({
@@ -102,26 +146,31 @@ export const sendDocument = async ({
     throw new Error('Document has no recipients');
   }
 
-  if (isDocumentCompleted(envelope.status)) {
+  const mustUseAtomicExecution = requireDraftStatus || isBizBuddyExternalId(envelope.externalId);
+
+  if (mustUseAtomicExecution && envelope.status !== DocumentStatus.DRAFT) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Document is no longer a draft',
+    });
+  }
+
+  if (isBizBuddyExternalId(envelope.externalId) && !expectedExecution) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, {
+      message: 'Expected execution lease is required for correlated documents',
+    });
+  }
+
+  if (mustUseAtomicExecution && envelope.formValues) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, {
+      message: 'Form values are not supported by atomic V1 dispatch',
+    });
+  }
+
+  if (!mustUseAtomicExecution && isDocumentCompleted(envelope.status)) {
     throw new Error('Can not send completed document');
   }
 
   const legacyDocumentId = mapSecondaryIdToDocumentId(envelope.secondaryId);
-
-  const signingOrder = envelope.documentMeta?.signingOrder || DocumentSigningOrder.PARALLEL;
-
-  let recipientsToNotify = envelope.recipients;
-
-  if (signingOrder === DocumentSigningOrder.SEQUENTIAL) {
-    // Get the currently active recipient.
-    recipientsToNotify = envelope.recipients
-      .filter((r) => r.signingStatus === SigningStatus.NOT_SIGNED && r.role !== RecipientRole.CC)
-      .slice(0, 1);
-
-    // Secondary filter so we aren't resending if the current active recipient has already
-    // received the envelope.
-    recipientsToNotify.filter((r) => r.sendStatus !== SendStatus.SENT);
-  }
 
   if (envelope.envelopeItems.length === 0) {
     throw new Error('Missing envelope items');
@@ -169,12 +218,270 @@ export const sendDocument = async ({
     });
   }
 
+  let preparedExecutionPdfSnapshot: PreparedExecutionPdfSnapshot | null = null;
+
+  if (isBizBuddyExternalId(envelope.externalId)) {
+    if (!expectedExecution) {
+      throw new AppError(AppErrorCode.INVALID_REQUEST, {
+        message: 'Expected execution lease is required for correlated documents',
+      });
+    }
+
+    if (envelope.internalVersion !== 1 || envelope.envelopeItems.length !== 1) {
+      throw new AppError(AppErrorCode.CONFLICT, {
+        message: 'Correlated execution requires exactly one V1 PDF item',
+      });
+    }
+
+    if (expectedExecution.expectedPdf.byteLength > MAX_ATOMIC_EXECUTION_PDF_BYTES) {
+      throw new AppError(AppErrorCode.INVALID_REQUEST, {
+        message: 'Expected PDF exceeds the configured document size limit',
+      });
+    }
+
+    const sourceEnvelopeItem = envelope.envelopeItems[0];
+    let sourcePdf: Uint8Array;
+
+    try {
+      sourcePdf = await getFileServerSide(sourceEnvelopeItem.documentData, {
+        maxBytes: expectedExecution.expectedPdf.byteLength,
+        timeoutMs: ATOMIC_EXECUTION_PDF_READ_TIMEOUT_MS,
+      });
+    } catch (error) {
+      if (error instanceof FileSizeLimitExceededError) {
+        throw new AppError(AppErrorCode.CONFLICT, {
+          message: 'Uploaded PDF does not match the expected execution content',
+        });
+      }
+
+      throw error;
+    }
+
+    const actualSha256 = createHash('sha256').update(sourcePdf).digest('hex');
+
+    if (
+      sourcePdf.byteLength !== expectedExecution.expectedPdf.byteLength ||
+      actualSha256 !== expectedExecution.expectedPdf.sha256
+    ) {
+      throw new AppError(AppErrorCode.CONFLICT, {
+        message: 'Uploaded PDF does not match the expected execution content',
+      });
+    }
+
+    const immutableBytes = Uint8Array.from(sourcePdf);
+    const { documentData } = await putInternalPdfSnapshotServerSide({
+      name: envelope.title,
+      type: 'application/pdf',
+      arrayBuffer: async () => await Promise.resolve(immutableBytes.buffer),
+    });
+
+    preparedExecutionPdfSnapshot = {
+      sourceEnvelopeItemId: sourceEnvelopeItem.id,
+      sourceDocumentDataId: sourceEnvelopeItem.documentData.id,
+      documentData,
+    };
+  }
+
   const allRecipientsHaveNoActionToTake = envelope.recipients.every(
     (recipient) =>
       recipient.role === RecipientRole.CC || recipient.signingStatus === SigningStatus.SIGNED,
   );
 
+  const assertLockedExecutionLease = async (tx: Prisma.TransactionClient) => {
+    if (!expectedExecution) return;
+
+    const lockedExecution = await tx.envelope.findUnique({
+      where: {
+        id: envelope.id,
+      },
+      select: {
+        externalId: true,
+        teamId: true,
+        documentMeta: {
+          select: {
+            signingOrder: true,
+          },
+        },
+        recipients: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            signingOrder: true,
+          },
+        },
+        fields: {
+          select: {
+            id: true,
+            recipientId: true,
+            type: true,
+            page: true,
+            positionX: true,
+            positionY: true,
+            width: true,
+            height: true,
+          },
+        },
+        envelopeItems: {
+          select: {
+            id: true,
+            documentDataId: true,
+          },
+        },
+      },
+    });
+
+    const lockedSourceItem = lockedExecution?.envelopeItems[0];
+
+    if (
+      !lockedExecution ||
+      lockedExecution.teamId !== teamId ||
+      !matchesExpectedDocumentExecution(lockedExecution, expectedExecution) ||
+      (preparedExecutionPdfSnapshot !== null &&
+        (lockedExecution.envelopeItems.length !== 1 ||
+          lockedSourceItem?.id !== preparedExecutionPdfSnapshot.sourceEnvelopeItemId ||
+          lockedSourceItem.documentDataId !== preparedExecutionPdfSnapshot.sourceDocumentDataId))
+    ) {
+      throw new AppError(AppErrorCode.CONFLICT, {
+        message: 'Document execution lease no longer matches',
+      });
+    }
+  };
+
+  const attachPreparedExecutionPdfSnapshot = async (tx: Prisma.TransactionClient) => {
+    if (!preparedExecutionPdfSnapshot) return;
+
+    const attached = await tx.envelopeItem.updateMany({
+      where: {
+        id: preparedExecutionPdfSnapshot.sourceEnvelopeItemId,
+        envelopeId: envelope.id,
+        documentDataId: preparedExecutionPdfSnapshot.sourceDocumentDataId,
+      },
+      data: {
+        documentDataId: preparedExecutionPdfSnapshot.documentData.id,
+      },
+    });
+
+    if (attached.count !== 1) {
+      throw new AppError(AppErrorCode.CONFLICT, {
+        message: 'Document PDF changed before dispatch',
+      });
+    }
+  };
+
+  const cleanUpPreparedExecutionPdfSnapshot = async () => {
+    if (!preparedExecutionPdfSnapshot) return;
+
+    try {
+      const unreferencedSnapshot = await prisma.documentData.findFirst({
+        where: {
+          id: preparedExecutionPdfSnapshot.documentData.id,
+          envelopeItem: null,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      if (!unreferencedSnapshot) return;
+
+      await deleteFile(preparedExecutionPdfSnapshot.documentData);
+
+      const deleted = await prisma.documentData.deleteMany({
+        where: {
+          id: preparedExecutionPdfSnapshot.documentData.id,
+          envelopeItem: null,
+        },
+      });
+
+      if (deleted.count !== 1) {
+        logger.error({
+          message: 'Execution PDF snapshot cleanup lost its unreferenced-row guard',
+          documentDataId: preparedExecutionPdfSnapshot.documentData.id,
+        });
+      }
+    } catch (error) {
+      // Cleanup is best-effort and must never replace the dispatch error.
+      logger.warn({
+        message: 'Failed to clean up an unreferenced execution PDF snapshot',
+        documentDataId: preparedExecutionPdfSnapshot.documentData.id,
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      });
+    }
+  };
+
   if (allRecipientsHaveNoActionToTake) {
+    let claimedEnvelope:
+      | (Envelope & {
+          documentMeta: typeof envelope.documentMeta;
+          recipients: typeof envelope.recipients;
+        })
+      | null = null;
+
+    if (mustUseAtomicExecution) {
+      try {
+        claimedEnvelope = await prisma.$transaction(async (tx) =>
+          withDocumentDraftMutationGuard(
+            {
+              tx,
+              envelopeId: envelope.id,
+              teamId,
+              expectedExternalId: isBizBuddyExternalId(envelope.externalId)
+                ? envelope.externalId
+                : undefined,
+              transitionToPending: true,
+            },
+            async () => {
+              await assertLockedExecutionLease(tx);
+              await attachPreparedExecutionPdfSnapshot(tx);
+
+              if (documentEmailSettings) {
+                const updatedDocumentMeta = await tx.documentMeta.update({
+                  where: {
+                    id: envelope.documentMetaId,
+                  },
+                  data: {
+                    emailSettings: documentEmailSettings,
+                  },
+                });
+                const changes = diffDocumentMetaChanges(
+                  envelope.documentMeta ?? {},
+                  updatedDocumentMeta,
+                );
+
+                if (changes.length > 0) {
+                  await tx.documentAuditLog.create({
+                    data: createDocumentAuditLogData({
+                      type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
+                      envelopeId: envelope.id,
+                      metadata: requestMetadata,
+                      data: {
+                        changes,
+                      },
+                    }),
+                  });
+                }
+              }
+
+              return tx.envelope.findFirstOrThrow({
+                where: {
+                  id: envelope.id,
+                },
+                include: {
+                  documentMeta: true,
+                  recipients: true,
+                },
+              });
+            },
+          ),
+        );
+      } catch (error) {
+        await cleanUpPreparedExecutionPdfSnapshot();
+        throw error;
+      }
+    }
+
     await jobs.triggerJob({
       name: 'internal.seal-document',
       payload: {
@@ -184,15 +491,18 @@ export const sendDocument = async ({
     });
 
     // Keep the return type the same for the `sendDocument` method
-    return await prisma.envelope.findFirstOrThrow({
-      where: {
-        id: envelope.id,
-      },
-      include: {
-        documentMeta: true,
-        recipients: true,
-      },
-    });
+    return (
+      claimedEnvelope ??
+      (await prisma.envelope.findFirstOrThrow({
+        where: {
+          id: envelope.id,
+        },
+        include: {
+          documentMeta: true,
+          recipients: true,
+        },
+      }))
+    );
   }
 
   const fieldsToAutoInsert: { fieldId: number; customText: string }[] = [];
@@ -217,89 +527,172 @@ export const sendDocument = async ({
     }
   }
 
-  const updatedEnvelope = await prisma.$transaction(async (tx) => {
-    if (envelope.status === DocumentStatus.DRAFT) {
-      await tx.documentAuditLog.create({
-        data: createDocumentAuditLogData({
-          type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_SENT,
-          envelopeId: envelope.id,
-          metadata: requestMetadata,
-          data: {},
-        }),
-      });
-    }
+  const updatedEnvelope = await prisma
+    .$transaction(async (tx) => {
+      const mutateDocumentForSend = async () => {
+        if (mustUseAtomicExecution) {
+          await assertLockedExecutionLease(tx);
+          await attachPreparedExecutionPdfSnapshot(tx);
+        }
 
-    if (envelope.internalVersion === 2) {
-      const autoInsertedFields = await Promise.all(
-        fieldsToAutoInsert.map(async (field) => {
-          // Warning: Only auto-insert fields if the recipient has not been sent the document yet.
-          return await tx.field.update({
+        if (documentEmailSettings) {
+          const updatedDocumentMeta = await tx.documentMeta.update({
             where: {
-              id: field.fieldId,
+              id: envelope.documentMetaId,
             },
             data: {
-              customText: field.customText,
-              inserted: true,
+              emailSettings: documentEmailSettings,
             },
           });
-        }),
-      );
+          const changes = diffDocumentMetaChanges(envelope.documentMeta ?? {}, updatedDocumentMeta);
 
-      await tx.documentAuditLog.create({
-        data: createDocumentAuditLogData({
-          type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_FIELDS_AUTO_INSERTED,
-          envelopeId: envelope.id,
+          if (changes.length > 0) {
+            await tx.documentAuditLog.create({
+              data: createDocumentAuditLogData({
+                type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_META_UPDATED,
+                envelopeId: envelope.id,
+                metadata: requestMetadata,
+                data: {
+                  changes,
+                },
+              }),
+            });
+          }
+        }
+
+        if (envelope.status === DocumentStatus.DRAFT) {
+          await tx.documentAuditLog.create({
+            data: createDocumentAuditLogData({
+              type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_SENT,
+              envelopeId: envelope.id,
+              metadata: requestMetadata,
+              data: {},
+            }),
+          });
+        }
+
+        if (envelope.internalVersion === 2) {
+          const autoInsertedFields = await Promise.all(
+            fieldsToAutoInsert.map(async (field) => {
+              // Warning: Only auto-insert fields if the recipient has not been sent the document yet.
+              return await tx.field.update({
+                where: {
+                  id: field.fieldId,
+                },
+                data: {
+                  customText: field.customText,
+                  inserted: true,
+                },
+              });
+            }),
+          );
+
+          await tx.documentAuditLog.create({
+            data: createDocumentAuditLogData({
+              type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_FIELDS_AUTO_INSERTED,
+              envelopeId: envelope.id,
+              data: {
+                fields: autoInsertedFields.map((field) => ({
+                  fieldId: field.id,
+                  fieldType: field.type,
+                  recipientId: field.recipientId,
+                })),
+              },
+              // Don't put metadata or user here since it's a system event.
+            }),
+          });
+        }
+
+        const expiresAt = resolveExpiresAt(envelope.documentMeta?.envelopeExpirationPeriod ?? null);
+
+        // Set expiresAt on each recipient that hasn't already signed/rejected.
+        // Exclude CC recipients since they don't sign and shouldn't be subject to expiry.
+        if (expiresAt) {
+          await tx.recipient.updateMany({
+            where: {
+              envelopeId: envelope.id,
+              signingStatus: {
+                notIn: [SigningStatus.SIGNED, SigningStatus.REJECTED],
+              },
+              role: {
+                not: RecipientRole.CC,
+              },
+            },
+            data: {
+              expiresAt,
+              expirationNotifiedAt: null,
+            },
+          });
+        }
+
+        if (mustUseAtomicExecution) {
+          return tx.envelope.findFirstOrThrow({
+            where: {
+              id: envelope.id,
+            },
+            include: {
+              documentMeta: true,
+              recipients: true,
+            },
+          });
+        }
+
+        return tx.envelope.update({
+          where: {
+            id: envelope.id,
+          },
           data: {
-            fields: autoInsertedFields.map((field) => ({
-              fieldId: field.id,
-              fieldType: field.type,
-              recipientId: field.recipientId,
-            })),
+            status: DocumentStatus.PENDING,
           },
-          // Don't put metadata or user here since it's a system event.
-        }),
-      });
-    }
-
-    const expiresAt = resolveExpiresAt(envelope.documentMeta?.envelopeExpirationPeriod ?? null);
-
-    // Set expiresAt on each recipient that hasn't already signed/rejected.
-    // Exclude CC recipients since they don't sign and shouldn't be subject to expiry.
-    if (expiresAt) {
-      await tx.recipient.updateMany({
-        where: {
-          envelopeId: envelope.id,
-          signingStatus: {
-            notIn: [SigningStatus.SIGNED, SigningStatus.REJECTED],
+          include: {
+            documentMeta: true,
+            recipients: true,
           },
-          role: {
-            not: RecipientRole.CC,
-          },
-        },
-        data: {
-          expiresAt,
-          expirationNotifiedAt: null,
-        },
-      });
-    }
+        });
+      };
 
-    return await tx.envelope.update({
-      where: {
-        id: envelope.id,
-      },
-      data: {
-        status: DocumentStatus.PENDING,
-      },
-      include: {
-        documentMeta: true,
-        recipients: true,
-      },
+      if (mustUseAtomicExecution) {
+        return withDocumentDraftMutationGuard(
+          {
+            tx,
+            envelopeId: envelope.id,
+            teamId,
+            expectedExternalId: isBizBuddyExternalId(envelope.externalId)
+              ? envelope.externalId
+              : undefined,
+            transitionToPending: true,
+          },
+          mutateDocumentForSend,
+        );
+      }
+
+      return mutateDocumentForSend();
+    })
+    .catch(async (error: unknown) => {
+      await cleanUpPreparedExecutionPdfSnapshot();
+      throw error;
     });
-  });
 
   const isRecipientSigningRequestEmailEnabled = extractDerivedDocumentEmailSettings(
-    envelope.documentMeta,
+    updatedEnvelope.documentMeta,
   ).recipientSigningRequest;
+  const signingOrder = updatedEnvelope.documentMeta?.signingOrder || DocumentSigningOrder.PARALLEL;
+  const recipientsToNotify =
+    signingOrder === DocumentSigningOrder.SEQUENTIAL
+      ? updatedEnvelope.recipients
+          .filter(
+            (recipient) =>
+              recipient.signingStatus === SigningStatus.NOT_SIGNED &&
+              recipient.role !== RecipientRole.CC &&
+              recipient.sendStatus !== SendStatus.SENT,
+          )
+          .sort(
+            (left, right) =>
+              (left.signingOrder ?? Number.MAX_SAFE_INTEGER) -
+                (right.signingOrder ?? Number.MAX_SAFE_INTEGER) || left.id - right.id,
+          )
+          .slice(0, 1)
+      : updatedEnvelope.recipients;
 
   // Only send email if one of the following is true:
   // - It is explicitly set
@@ -326,7 +719,7 @@ export const sendDocument = async ({
 
   await triggerWebhook({
     event: WebhookTriggerEvents.DOCUMENT_SENT,
-    data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(updatedEnvelope)),
+    data: () => mapEnvelopeToWebhookDocumentPayload(updatedEnvelope),
     userId,
     teamId,
   });

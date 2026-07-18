@@ -16,8 +16,8 @@ name: Build P5 Documenso Image
 #
 # Triggers:
 #   - push to p5/patched: rebuild on every patch commit
-#   - weekly cron: pick up upstream base image (`documenso/documenso:latest`)
-#     and apply our patches on top
+#   - weekly cron: refresh mutable base-image layers used by the source build
+#     (upstream source changes still require an intentional p5/patched rebase)
 #   - manual dispatch: ad-hoc rebuild
 #
 # Output: ghcr.io/parallelfive/documenso:latest + per-SHA tag
@@ -27,7 +27,7 @@ on:
   push:
     branches: [p5/patched]
   schedule:
-    - cron: '0 6 * * 1'    # Mondays 06:00 UTC — pick up new upstream base image
+    - cron: '0 6 * * 1'    # Mondays 06:00 UTC — refresh mutable base-image layers
   workflow_dispatch:
 
 env:

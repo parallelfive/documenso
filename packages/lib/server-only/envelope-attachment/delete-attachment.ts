@@ -4,6 +4,7 @@ import { AppError, AppErrorCode } from '@documenso/lib/errors/app-error';
 import { prisma } from '@documenso/prisma';
 
 import { buildTeamWhereQuery } from '../../utils/teams';
+import { assertCorrelatedDocumentContentImmutable } from '../envelope/assert-correlated-document-content-immutable';
 
 export type DeleteAttachmentOptions = {
   id: string;
@@ -29,6 +30,8 @@ export const deleteAttachment = async ({ id, userId, teamId }: DeleteAttachmentO
       message: 'Attachment not found',
     });
   }
+
+  assertCorrelatedDocumentContentImmutable(attachment.envelope);
 
   if (
     attachment.envelope.status === DocumentStatus.COMPLETED ||

@@ -1,4 +1,10 @@
-import { EnvelopeType, RecipientRole, SendStatus, SigningStatus } from '@prisma/client';
+import {
+  DocumentStatus,
+  EnvelopeType,
+  RecipientRole,
+  SendStatus,
+  SigningStatus,
+} from '@prisma/client';
 
 import { DOCUMENT_AUDIT_LOG_TYPE } from '@documenso/lib/types/document-audit-logs';
 import type { TRecipientAccessAuthTypes } from '@documenso/lib/types/document-auth';
@@ -14,11 +20,13 @@ import {
 import { createRecipientAuthOptions } from '@documenso/lib/utils/document-auth';
 import { prisma } from '@documenso/prisma';
 
+import { isBizBuddyExternalId } from '../../constants/app';
 import { AppError, AppErrorCode } from '../../errors/app-error';
 import { extractLegacyIds } from '../../universal/id';
 import { type EnvelopeIdOptions } from '../../utils/envelope';
 import { mapFieldToLegacyField } from '../../utils/fields';
 import { canRecipientBeModified } from '../../utils/recipients';
+import { withDocumentDraftMutationGuard } from '../document/with-document-draft-mutation-guard';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 
 export interface UpdateEnvelopeRecipientsOptions {
@@ -35,6 +43,7 @@ export interface UpdateEnvelopeRecipientsOptions {
     actionAuth?: TRecipientActionAuthTypes[];
   }[];
   requestMetadata: ApiRequestMetadata;
+  requireDraftStatus?: boolean;
 }
 
 export const updateEnvelopeRecipients = async ({
@@ -43,6 +52,7 @@ export const updateEnvelopeRecipients = async ({
   id,
   recipients,
   requestMetadata,
+  requireDraftStatus = false,
 }: UpdateEnvelopeRecipientsOptions) => {
   const { envelopeWhereInput } = await getEnvelopeWhereInput({
     id,
@@ -74,9 +84,26 @@ export const updateEnvelopeRecipients = async ({
     });
   }
 
+  const isCorrelatedDocument =
+    envelope.type === EnvelopeType.DOCUMENT && isBizBuddyExternalId(envelope.externalId);
+
+  if (isCorrelatedDocument) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Correlated document recipients are immutable after initial population',
+    });
+  }
+
   if (envelope.completedAt) {
     throw new AppError(AppErrorCode.INVALID_REQUEST, {
       message: 'Envelope already complete',
+    });
+  }
+
+  const mustBeDraft = requireDraftStatus;
+
+  if (mustBeDraft && envelope.status !== DocumentStatus.DRAFT) {
+    throw new AppError(AppErrorCode.CONFLICT, {
+      message: 'Document is no longer a draft',
     });
   }
 
@@ -115,84 +142,98 @@ export const updateEnvelopeRecipients = async ({
   });
 
   const updatedRecipients = await prisma.$transaction(async (tx) => {
-    return await Promise.all(
-      recipientsToUpdate.map(async ({ originalRecipient, updateData }) => {
-        let authOptions = ZRecipientAuthOptionsSchema.parse(originalRecipient.authOptions);
+    const updateRecipients = async () =>
+      await Promise.all(
+        recipientsToUpdate.map(async ({ originalRecipient, updateData }) => {
+          let authOptions = ZRecipientAuthOptionsSchema.parse(originalRecipient.authOptions);
 
-        if (updateData.actionAuth !== undefined || updateData.accessAuth !== undefined) {
-          authOptions = createRecipientAuthOptions({
-            accessAuth: updateData.accessAuth || authOptions.accessAuth,
-            actionAuth: updateData.actionAuth || authOptions.actionAuth,
-          });
-        }
-
-        const mergedRecipient = {
-          ...originalRecipient,
-          ...updateData,
-        };
-
-        const updatedRecipient = await tx.recipient.update({
-          where: {
-            id: originalRecipient.id,
-            envelopeId: envelope.id,
-          },
-          data: {
-            name: mergedRecipient.name,
-            email: mergedRecipient.email,
-            role: mergedRecipient.role,
-            signingOrder: mergedRecipient.signingOrder,
-            envelopeId: envelope.id,
-            sendStatus:
-              mergedRecipient.role === RecipientRole.CC ? SendStatus.SENT : SendStatus.NOT_SENT,
-            signingStatus:
-              mergedRecipient.role === RecipientRole.CC
-                ? SigningStatus.SIGNED
-                : SigningStatus.NOT_SIGNED,
-            authOptions,
-          },
-          include: {
-            fields: true,
-          },
-        });
-
-        // Clear all fields if the recipient role is changed to a type that cannot have fields.
-        if (
-          originalRecipient.role !== updatedRecipient.role &&
-          (updatedRecipient.role === RecipientRole.CC ||
-            updatedRecipient.role === RecipientRole.VIEWER)
-        ) {
-          await tx.field.deleteMany({
-            where: {
-              recipientId: updatedRecipient.id,
-            },
-          });
-        }
-
-        // Handle recipient updated audit log.
-        if (envelope.type === EnvelopeType.DOCUMENT) {
-          const changes = diffRecipientChanges(originalRecipient, updatedRecipient);
-
-          if (changes.length > 0) {
-            await tx.documentAuditLog.create({
-              data: createDocumentAuditLogData({
-                type: DOCUMENT_AUDIT_LOG_TYPE.RECIPIENT_UPDATED,
-                envelopeId: envelope.id,
-                metadata: requestMetadata,
-                data: {
-                  recipientEmail: updatedRecipient.email,
-                  recipientName: updatedRecipient.name,
-                  recipientId: updatedRecipient.id,
-                  recipientRole: updatedRecipient.role,
-                  changes,
-                },
-              }),
+          if (updateData.actionAuth !== undefined || updateData.accessAuth !== undefined) {
+            authOptions = createRecipientAuthOptions({
+              accessAuth: updateData.accessAuth || authOptions.accessAuth,
+              actionAuth: updateData.actionAuth || authOptions.actionAuth,
             });
           }
-        }
 
-        return updatedRecipient;
-      }),
-    );
+          const mergedRecipient = {
+            ...originalRecipient,
+            ...updateData,
+          };
+
+          const updatedRecipient = await tx.recipient.update({
+            where: {
+              id: originalRecipient.id,
+              envelopeId: envelope.id,
+            },
+            data: {
+              name: mergedRecipient.name,
+              email: mergedRecipient.email,
+              role: mergedRecipient.role,
+              signingOrder: mergedRecipient.signingOrder,
+              envelopeId: envelope.id,
+              sendStatus:
+                mergedRecipient.role === RecipientRole.CC ? SendStatus.SENT : SendStatus.NOT_SENT,
+              signingStatus:
+                mergedRecipient.role === RecipientRole.CC
+                  ? SigningStatus.SIGNED
+                  : SigningStatus.NOT_SIGNED,
+              authOptions,
+            },
+            include: {
+              fields: true,
+            },
+          });
+
+          // Clear all fields if the recipient role is changed to a type that cannot have fields.
+          if (
+            originalRecipient.role !== updatedRecipient.role &&
+            (updatedRecipient.role === RecipientRole.CC ||
+              updatedRecipient.role === RecipientRole.VIEWER)
+          ) {
+            await tx.field.deleteMany({
+              where: {
+                recipientId: updatedRecipient.id,
+              },
+            });
+          }
+
+          // Handle recipient updated audit log.
+          if (envelope.type === EnvelopeType.DOCUMENT) {
+            const changes = diffRecipientChanges(originalRecipient, updatedRecipient);
+
+            if (changes.length > 0) {
+              await tx.documentAuditLog.create({
+                data: createDocumentAuditLogData({
+                  type: DOCUMENT_AUDIT_LOG_TYPE.RECIPIENT_UPDATED,
+                  envelopeId: envelope.id,
+                  metadata: requestMetadata,
+                  data: {
+                    recipientEmail: updatedRecipient.email,
+                    recipientName: updatedRecipient.name,
+                    recipientId: updatedRecipient.id,
+                    recipientRole: updatedRecipient.role,
+                    changes,
+                  },
+                }),
+              });
+            }
+          }
+
+          return updatedRecipient;
+        }),
+      );
+
+    if (mustBeDraft) {
+      return withDocumentDraftMutationGuard(
+        {
+          tx,
+          envelopeId: envelope.id,
+          teamId,
+        },
+        updateRecipients,
+      );
+    }
+
+    return updateRecipients();
   });
 
   return {
