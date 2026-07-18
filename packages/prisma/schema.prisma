@@ -500,6 +500,23 @@ model DocumentData {
   data         String
   initialData  String
   envelopeItem EnvelopeItem?
+
+  // S3-only partial indexes for data/initialData are migration-managed because
+  // Prisma cannot model partial indexes and BYTES rows can exceed btree limits.
+}
+
+model DocumentDataStorageCleanup {
+  id                     String    @id @default(cuid())
+  key                    String    @unique
+  documentDataId         String?   @unique
+  notBefore              DateTime  @default(now())
+  earlyDeleteEnabled     Boolean   @default(true)
+  earlyDeleteAttemptedAt DateTime?
+  attemptCount           Int       @default(0)
+  lastAttemptAt          DateTime?
+  createdAt              DateTime  @default(now())
+
+  @@index([notBefore, createdAt])
 }
 
 enum DocumentDistributionMethod {

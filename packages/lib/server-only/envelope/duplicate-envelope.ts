@@ -1,4 +1,9 @@
-import { DocumentSource, EnvelopeType, WebhookTriggerEvents } from '@prisma/client';
+import {
+  DocumentDataType,
+  DocumentSource,
+  EnvelopeType,
+  WebhookTriggerEvents,
+} from '@prisma/client';
 import pMap from 'p-map';
 import { omit } from 'remeda';
 
@@ -8,6 +13,10 @@ import { AppError, AppErrorCode } from '../../errors/app-error';
 import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
 import { nanoid, prefixedId } from '../../universal/id';
 import type { EnvelopeIdOptions } from '../../utils/envelope';
+import {
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+  lockDocumentDataStorageKeys,
+} from '../document-data/stage-document-data-storage-cleanup';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 import { incrementDocumentId, incrementTemplateId } from '../envelope/increment-id';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
@@ -56,6 +65,7 @@ export const duplicateEnvelope = async ({
         include: {
           documentData: {
             select: {
+              id: true,
               data: true,
               initialData: true,
               type: true,
@@ -93,80 +103,148 @@ export const duplicateEnvelope = async ({
 
   const targetType = duplicateAsTemplate ? EnvelopeType.TEMPLATE : envelope.type;
 
-  const [{ legacyNumberId, secondaryId }, createdDocumentMeta] = await Promise.all([
-    targetType === EnvelopeType.DOCUMENT
-      ? incrementDocumentId().then(({ documentId, formattedDocumentId }) => ({
-          legacyNumberId: documentId,
-          secondaryId: formattedDocumentId,
-        }))
-      : incrementTemplateId().then(({ templateId, formattedTemplateId }) => ({
-          legacyNumberId: templateId,
-          secondaryId: formattedTemplateId,
-        })),
-    prisma.documentMeta.create({
-      data: {
-        ...omit(envelope.documentMeta, ['id']),
-        emailSettings: envelope.documentMeta.emailSettings || undefined,
-      },
-    }),
-  ]);
+  const { legacyNumberId, secondaryId } = await (targetType === EnvelopeType.DOCUMENT
+    ? incrementDocumentId().then(({ documentId, formattedDocumentId }) => ({
+        legacyNumberId: documentId,
+        secondaryId: formattedDocumentId,
+      }))
+    : incrementTemplateId().then(({ templateId, formattedTemplateId }) => ({
+        legacyNumberId: templateId,
+        secondaryId: formattedTemplateId,
+      })));
 
   const duplicatedTemplateType =
     envelope.templateType === 'ORGANISATION' && envelope.teamId !== teamId
       ? 'PRIVATE'
       : (envelope.templateType ?? undefined);
 
-  const duplicatedEnvelope = await prisma.envelope.create({
-    data: {
-      id: prefixedId('envelope'),
-      secondaryId,
-      type: targetType,
-      internalVersion: envelope.internalVersion,
-      userId,
-      teamId,
-      title: envelope.title + ' (copy)',
-      documentMetaId: createdDocumentMeta.id,
-      authOptions: envelope.authOptions || undefined,
-      visibility: envelope.visibility,
-      templateType: duplicatedTemplateType,
-      publicTitle: envelope.publicTitle ?? undefined,
-      publicDescription: envelope.publicDescription ?? undefined,
-      source:
-        targetType === EnvelopeType.DOCUMENT ? DocumentSource.DOCUMENT : DocumentSource.TEMPLATE,
-    },
-    include: {
-      recipients: true,
-      documentMeta: true,
-    },
-  });
-
   // Key = original envelope item ID
   // Value = duplicated envelope item ID.
   const oldEnvelopeItemToNewEnvelopeItemIdMap: Record<string, string> = {};
 
-  // Duplicate the envelope items.
-  await Promise.all(
-    envelope.envelopeItems.map(async (envelopeItem) => {
-      const duplicatedDocumentData = await prisma.documentData.create({
+  // Source-key locks and exact source-row locks are acquired before the target
+  // exists. If cancellation won, this transaction leaves no partial copy. If
+  // duplication won, cancellation sees the new reference before staging.
+  const duplicatedEnvelope = await prisma.$transaction(
+    async (tx) => {
+      await lockDocumentDataStorageKeys({
+        tx,
+        keys: envelope.envelopeItems.flatMap(({ documentData }) =>
+          documentData.type === DocumentDataType.S3_PATH
+            ? [documentData.data, documentData.initialData]
+            : [],
+        ),
+      });
+
+      for (const documentDataId of [
+        ...new Set(envelope.envelopeItems.map(({ documentData }) => documentData.id)),
+      ].sort()) {
+        const lockedSource = await tx.$queryRaw<Array<{ id: string }>>`
+          SELECT "id"
+          FROM "DocumentData"
+          WHERE "id" = ${documentDataId}
+          FOR KEY SHARE
+        `;
+
+        if (lockedSource.length !== 1) {
+          throw new AppError(AppErrorCode.CONFLICT, {
+            message: 'Source document changed before it could be duplicated',
+          });
+        }
+      }
+
+      const currentSourceDocumentData = await tx.documentData.findMany({
+        where: {
+          id: {
+            in: envelope.envelopeItems.map(({ documentData }) => documentData.id),
+          },
+        },
+        select: {
+          id: true,
+          type: true,
+          data: true,
+          initialData: true,
+        },
+      });
+      const currentSourceDocumentDataById = new Map(
+        currentSourceDocumentData.map((documentData) => [documentData.id, documentData]),
+      );
+
+      for (const { documentData } of envelope.envelopeItems) {
+        const current = currentSourceDocumentDataById.get(documentData.id);
+
+        if (
+          !current ||
+          current.type !== documentData.type ||
+          current.data !== documentData.data ||
+          current.initialData !== documentData.initialData
+        ) {
+          throw new AppError(AppErrorCode.CONFLICT, {
+            message: 'Source document changed before it could be duplicated',
+          });
+        }
+      }
+
+      const createdDocumentMeta = await tx.documentMeta.create({
         data: {
-          type: envelopeItem.documentData.type,
-          data: envelopeItem.documentData.initialData,
-          initialData: envelopeItem.documentData.initialData,
+          ...omit(envelope.documentMeta, ['id']),
+          emailSettings: envelope.documentMeta.emailSettings || undefined,
         },
       });
 
-      const duplicatedEnvelopeItem = await prisma.envelopeItem.create({
+      const targetEnvelope = await tx.envelope.create({
         data: {
-          id: prefixedId('envelope_item'),
-          title: envelopeItem.title,
-          order: envelopeItem.order,
-          envelopeId: duplicatedEnvelope.id,
-          documentDataId: duplicatedDocumentData.id,
+          id: prefixedId('envelope'),
+          secondaryId,
+          type: targetType,
+          internalVersion: envelope.internalVersion,
+          userId,
+          teamId,
+          title: envelope.title + ' (copy)',
+          documentMetaId: createdDocumentMeta.id,
+          authOptions: envelope.authOptions || undefined,
+          visibility: envelope.visibility,
+          templateType: duplicatedTemplateType,
+          publicTitle: envelope.publicTitle ?? undefined,
+          publicDescription: envelope.publicDescription ?? undefined,
+          source:
+            targetType === EnvelopeType.DOCUMENT
+              ? DocumentSource.DOCUMENT
+              : DocumentSource.TEMPLATE,
+        },
+        include: {
+          recipients: true,
+          documentMeta: true,
         },
       });
 
-      oldEnvelopeItemToNewEnvelopeItemIdMap[envelopeItem.id] = duplicatedEnvelopeItem.id;
-    }),
+      for (const envelopeItem of envelope.envelopeItems) {
+        const duplicatedDocumentData = await tx.documentData.create({
+          data: {
+            type: envelopeItem.documentData.type,
+            data: envelopeItem.documentData.initialData,
+            initialData: envelopeItem.documentData.initialData,
+          },
+        });
+
+        const duplicatedEnvelopeItem = await tx.envelopeItem.create({
+          data: {
+            id: prefixedId('envelope_item'),
+            title: envelopeItem.title,
+            order: envelopeItem.order,
+            envelopeId: targetEnvelope.id,
+            documentDataId: duplicatedDocumentData.id,
+          },
+        });
+
+        oldEnvelopeItemToNewEnvelopeItemIdMap[envelopeItem.id] = duplicatedEnvelopeItem.id;
+      }
+
+      return targetEnvelope;
+    },
+    {
+      timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+    },
   );
 
   if (includeRecipients) {

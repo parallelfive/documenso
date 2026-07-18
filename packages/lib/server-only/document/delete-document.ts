@@ -21,6 +21,13 @@ import { type EnvelopeIdOptions, unsafeBuildEnvelopeIdQuery } from '../../utils/
 import { logger } from '../../utils/logger';
 import { isRecipientEmailValidForSending } from '../../utils/recipients';
 import { renderEmailWithI18N } from '../../utils/render-email-with-i18n';
+import { processDocumentDataStorageCleanupAfterCommit } from '../document-data/process-document-data-storage-cleanup';
+import {
+  DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+  getDocumentDataPresignReplayNotBefore,
+  lockEnvelopeDocumentDataForCleanup,
+  stageDocumentDataStorageCleanup,
+} from '../document-data/stage-document-data-storage-cleanup';
 import { getEmailContext } from '../email/get-email-context';
 import { getMemberRoles } from '../team/get-member-roles';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
@@ -198,35 +205,54 @@ const handleDocumentOwnerDelete = async ({
 
   // Hard delete draft and pending documents.
   let deletedEnvelope: Envelope;
+  let storageCleanupIds: string[] = [];
 
   try {
-    deletedEnvelope = await prisma.$transaction(async (tx) => {
-      // Currently redundant since deleting a document will delete the audit logs.
-      // However may be useful if we disassociate audit logs and documents if required.
-      await tx.documentAuditLog.create({
-        data: createDocumentAuditLogData({
+    deletedEnvelope = await prisma.$transaction(
+      async (tx) => {
+        const documentDataIds = await lockEnvelopeDocumentDataForCleanup({
+          tx,
           envelopeId: envelope.id,
-          type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_DELETED,
-          metadata: requestMetadata,
-          data: {
-            type: 'HARD',
-          },
-        }),
-      });
+        });
 
-      return await tx.envelope.delete({
-        where: {
-          id: envelope.id,
-          status: requireCancellableStatus
-            ? {
-                in: [DocumentStatus.DRAFT, DocumentStatus.PENDING],
-              }
-            : {
-                not: DocumentStatus.COMPLETED,
-              },
-        },
-      });
-    });
+        // Currently redundant since deleting a document will delete the audit logs.
+        // However may be useful if we disassociate audit logs and documents if required.
+        await tx.documentAuditLog.create({
+          data: createDocumentAuditLogData({
+            envelopeId: envelope.id,
+            type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_DELETED,
+            metadata: requestMetadata,
+            data: {
+              type: 'HARD',
+            },
+          }),
+        });
+
+        const result = await tx.envelope.delete({
+          where: {
+            id: envelope.id,
+            status: requireCancellableStatus
+              ? {
+                  in: [DocumentStatus.DRAFT, DocumentStatus.PENDING],
+                }
+              : {
+                  not: DocumentStatus.COMPLETED,
+                },
+          },
+        });
+
+        storageCleanupIds = await stageDocumentDataStorageCleanup({
+          tx,
+          documentDataIds,
+          notBefore: getDocumentDataPresignReplayNotBefore(),
+        });
+
+        return result;
+      },
+      {
+        timeout: DOCUMENT_DATA_STORAGE_TRANSACTION_TIMEOUT_MS,
+      },
+    );
   } catch (error) {
     if (
       requireCancellableStatus &&
@@ -242,6 +268,12 @@ const handleDocumentOwnerDelete = async ({
 
     throw error;
   }
+
+  await processDocumentDataStorageCleanupAfterCommit({
+    cleanupIds: storageCleanupIds,
+    envelopeId: envelope.id,
+    event: 'document-cancelled',
+  });
 
   const isEnvelopeDeleteEmailEnabled = extractDerivedDocumentEmailSettings(
     envelope.documentMeta,
