@@ -455,6 +455,28 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   atomic lifecycle transitions, and post-dispatch execution immutability across
   both REST and native mutation paths.
 
+### 7. Garage-compatible presigned PUT checksums — landed 2026-07-17
+
+- **Why:** the AWS SDK's default `WHEN_SUPPORTED` request-checksum policy adds
+  an optional CRC32 to `PutObject`. When the command is presigned without a
+  body, the URL binds `x-amz-checksum-crc32=AAAAAA==` for an empty object.
+  Garage correctly rejects a later nonempty PDF sent through that URL with
+  `InvalidDigest`.
+- **Behavior:** the shared S3 client now calculates request checksums only when
+  an operation requires one. `PutObject` presigns no longer contain checksum
+  query parameters, while SigV4 still uses `UNSIGNED-PAYLOAD` and direct
+  server-side uploads still send the exact nonempty body. Response checksum
+  validation retains the SDK default `WHEN_SUPPORTED` policy.
+- **Files:**
+  - `packages/lib/universal/upload/server-actions.ts` — explicit
+    `requestChecksumCalculation: 'WHEN_REQUIRED'`.
+  - `packages/lib/universal/upload/server-actions.test.ts` — real SDK presign
+    and loopback HTTP upload coverage for both PUT-presign entry points and
+    direct body uploads.
+- **Remove when:** upstream exposes an equivalent body-less `PutObject`
+  presigning policy, or the AWS SDK no longer derives optional payload
+  checksums from an absent body.
+
 ## Planned Patches
 
 (none — all patches are active and documented above)

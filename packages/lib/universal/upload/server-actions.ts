@@ -151,6 +151,11 @@ const getS3Client = () => {
     endpoint: env('NEXT_PRIVATE_UPLOAD_ENDPOINT') || undefined,
     forcePathStyle: env('NEXT_PRIVATE_UPLOAD_FORCE_PATH_STYLE') === 'true',
     region: env('NEXT_PRIVATE_UPLOAD_REGION') || 'us-east-1',
+    // PutObject checksums are optional. Enabling them only when required keeps
+    // a body-less presign from binding the empty CRC32 to a later nonempty
+    // upload. Response checksum validation intentionally retains the SDK
+    // default so downloads still validate supported object-store checksums.
+    requestChecksumCalculation: 'WHEN_REQUIRED',
     credentials: hasCredentials
       ? {
           accessKeyId: String(env('NEXT_PRIVATE_UPLOAD_ACCESS_KEY_ID')),
