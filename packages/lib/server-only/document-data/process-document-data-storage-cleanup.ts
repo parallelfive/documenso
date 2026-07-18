@@ -206,6 +206,9 @@ export const processDocumentDataStorageCleanup = async ({
           await prisma.documentDataStorageCleanup.updateMany({
             where: {
               id: cleanupTask.id,
+              notBefore: {
+                lte: referencedTaskNotBefore,
+              },
             },
             data: {
               earlyDeleteAttemptedAt: new Date(),

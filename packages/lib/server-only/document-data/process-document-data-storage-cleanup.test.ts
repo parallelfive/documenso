@@ -234,11 +234,54 @@ describe('processDocumentDataStorageCleanup', () => {
     expect(mocks.cleanupUpdateMany).toHaveBeenCalledWith({
       where: {
         id: 'cleanup-shared',
+        notBefore: {
+          lte: originalNotBefore,
+        },
       },
       data: {
         earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
       },
     });
+  });
+
+  it('keeps a concurrently extended live-reference generation early-eligible', async () => {
+    const selectedNotBefore = new Date('2030-01-01T00:01:00.000Z');
+    const referencedTaskNotBefore = new Date('2030-01-01T00:15:00.000Z');
+    mocks.cleanupFindMany.mockResolvedValue([
+      {
+        id: 'cleanup-live-reference-extended',
+        key: 'private/live-reference-extended.pdf',
+        notBefore: selectedNotBefore,
+        attemptCount: 0,
+      },
+    ]);
+    mocks.documentDataFindFirst.mockResolvedValue({ id: 'live-data' });
+    mocks.cleanupUpdateMany
+      .mockResolvedValueOnce({ count: 1 })
+      // A concurrent stage extended notBefore beyond this worker's generation.
+      .mockResolvedValueOnce({ count: 0 });
+
+    await expect(processDocumentDataStorageCleanup()).resolves.toEqual({
+      selectedCount: 1,
+      objectDeleteCount: 0,
+      acknowledgedCount: 0,
+      cancelledCount: 0,
+      deferredCount: 1,
+      failedCount: 0,
+    });
+
+    expect(mocks.cleanupUpdateMany).toHaveBeenNthCalledWith(2, {
+      where: {
+        id: 'cleanup-live-reference-extended',
+        notBefore: {
+          lte: referencedTaskNotBefore,
+        },
+      },
+      data: {
+        earlyDeleteAttemptedAt: new Date('2030-01-01T00:00:00.000Z'),
+      },
+    });
+    expect(mocks.deleteS3File).not.toHaveBeenCalled();
   });
 
   it('retains a task whose replay cutoff was concurrently extended after selection', async () => {
