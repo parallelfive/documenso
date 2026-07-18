@@ -1,0 +1,22 @@
+name: P5 Startup Contract
+
+on:
+  pull_request:
+    branches: [p5/patched]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  startup-contract:
+    name: Fail-closed startup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify fail-closed production startup
+        run: |
+          sh -n docker/start.sh
+          sh -n docker/start.test.sh
+          sh docker/start.test.sh

@@ -1,5 +1,7 @@
 #!/bin/sh
 
+set -eu
+
 # 🚀 Starting Documenso...
 printf "🚀 Starting Documenso...\n\n"
 
@@ -25,7 +27,15 @@ printf "📊 Certificate status: http://localhost:3000/api/certificate-status\n"
 printf "👥 Community: https://github.com/documenso/documenso\n\n"
 
 printf "🗄️  Running database migrations...\n"
-npx prisma migrate deploy --schema ../../packages/prisma/schema.prisma
+if npx prisma migrate deploy --schema ../../packages/prisma/schema.prisma; then
+    printf "✅ Database migrations completed successfully.\n"
+else
+    migration_status=$?
+    printf "❌ Database migrations failed (exit %s); refusing to start Documenso.\n" "$migration_status" >&2
+    exit "$migration_status"
+fi
 
 printf "🌟 Starting Documenso server...\n"
-HOSTNAME=0.0.0.0 node build/server/main.js
+HOSTNAME=0.0.0.0
+export HOSTNAME
+exec node build/server/main.js

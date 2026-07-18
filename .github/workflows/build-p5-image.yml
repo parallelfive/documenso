@@ -35,11 +35,30 @@ env:
   IMAGE_NAME: parallelfive/documenso
 
 jobs:
+  startup-contract:
+    # Keep the production entrypoint fail-closed before spending runner time
+    # building either architecture.
+    if: github.repository == 'parallelfive/documenso'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: p5/patched
+
+      - name: Verify fail-closed production startup
+        run: |
+          sh -n docker/start.sh
+          sh -n docker/start.test.sh
+          sh docker/start.test.sh
+
   build:
     # Guard: only run on the fork, never if someone re-imports this workflow
     # into upstream. Belt-and-suspenders since the file lives only on
     # p5/patched, but cheap insurance against accidental upstream rebase.
     if: github.repository == 'parallelfive/documenso'
+    needs: startup-contract
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +98,8 @@ jobs:
           # Build from source via upstream's docker/Dockerfile — Node/TS
           # forks can't overlay files onto a prebuilt image (see the
           # Dockerfile.p5 docstring for why). Our patches live in the
-          # source tree at apps/ + packages/, not as overlay COPY lines.
+          # source tree at apps/, packages/, and docker/, not as overlay
+          # COPY lines.
           file: docker/Dockerfile
           platforms: ${{ matrix.platform }}
           # Push as a digest-only image; the merge job stitches them into

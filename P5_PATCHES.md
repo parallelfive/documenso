@@ -40,9 +40,9 @@ included only after the intentional `p5/patched` rebase described below.
 
 ## Build mechanism — source build (not overlay)
 
-Unlike our `parallelfive/coolify` fork (PHP — overlays individual files onto the upstream image), Documenso is Node + TypeScript bundled by Turbo + Remix at build time. Patched `.ts` files have to be re-compiled into the bundle, so we publish a **full source-built image** rather than an overlay.
+Unlike our `parallelfive/coolify` fork (PHP — overlays individual files onto the upstream image), Documenso is Node + TypeScript bundled by Turbo + Remix at build time. Compiled application patches and production runtime-source patches must come from one reviewed checkout, so we publish a **full source-built image** rather than an overlay.
 
-`Dockerfile.p5` is a thin marker file. The actual build runs upstream's `docker/Dockerfile` against our patched checkout (referenced from `.github/workflows/build-p5-image.yml` via `file: docker/Dockerfile`). Patches live in the source tree at `apps/` + `packages/`, not as overlay COPY lines. Future upstream improvements to `docker/Dockerfile` flow through automatically on rebase.
+`Dockerfile.p5` is a thin marker file. The actual build runs upstream's `docker/Dockerfile` against our patched checkout (referenced from `.github/workflows/build-p5-image.yml` via `file: docker/Dockerfile`). Patches live in the source tree at `apps/`, `packages/`, and `docker/`, not as overlay COPY lines. Future upstream improvements to `docker/Dockerfile` flow through automatically on rebase.
 
 ## ⚠️ Do NOT click "Sync fork"
 
@@ -577,6 +577,34 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   and every backing object across native/API lifecycle paths with equivalent
   crash recovery, presign-replay protection, reference guards, bounded durable
   retry, and secret-safe observability.
+
+### 9. Fail-closed production startup — added 2026-07-18
+
+- **Why:** the upstream production entrypoint ran
+  `prisma migrate deploy` without checking its exit status, then started the
+  Node server even when schema migration failed. That could expose application
+  code against an older schema and disguise a failed release as a healthy
+  process.
+- **Behavior:** `docker/start.sh` uses POSIX `sh` fail-fast semantics, preserves
+  and returns the exact migration failure status, and refuses to invoke Node
+  unless migration succeeds. After a successful migration it exports the
+  production bind hostname and `exec`s Node, so the server replaces the shell
+  as PID 1 and receives container signals directly.
+- **Regression gate:** `docker/start.test.sh` runs entirely offline with
+  temporary `npx` and `node` stand-ins. It proves a migration failure never
+  reaches Node, a successful migration does, the configured hostname reaches
+  Node, the migration and server arguments stay exact, and Node replaces the
+  startup process. `.github/workflows/p5-startup-contract.yml` runs the gate
+  against every pull request targeting `p5/patched`, while
+  `.github/workflows/build-p5-image.yml` repeats it before either architecture
+  can build.
+- **Files:**
+  - `docker/start.sh` — fail-closed migration gate and PID 1 handoff.
+  - `docker/start.test.sh` — network- and database-free entrypoint regression.
+  - `.github/workflows/p5-startup-contract.yml` — lightweight feature-PR gate.
+  - `.github/workflows/build-p5-image.yml` — pre-build startup contract gate.
+- **Remove when:** upstream's production entrypoint fails closed on migration
+  errors, hands PID 1 to the server, and carries equivalent automated coverage.
 
 ## Planned Patches
 
