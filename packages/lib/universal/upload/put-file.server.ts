@@ -5,8 +5,13 @@ import { match } from 'ts-pattern';
 
 import { env } from '@documenso/lib/utils/env';
 
+import { ONE_MINUTE } from '../../constants/time';
 import { AppError } from '../../errors/app-error';
 import { createDocumentData } from '../../server-only/document-data/create-document-data';
+import {
+  createProvisionalInternalDocumentData,
+  reserveInternalSnapshotStorageCleanup,
+} from '../../server-only/document-data/stage-document-data-storage-cleanup';
 import { normalizePdf } from '../../server-only/pdf/normalize-pdf';
 import { logger } from '../../utils/logger';
 import { deleteS3File, uploadS3File } from './server-actions';
@@ -16,6 +21,8 @@ type File = {
   type: string;
   arrayBuffer: () => Promise<ArrayBuffer>;
 };
+
+export const INTERNAL_SNAPSHOT_UPLOAD_TIMEOUT_MS = 5 * ONE_MINUTE;
 
 /**
  * Uploads a document file to the appropriate storage location and creates
@@ -56,12 +63,25 @@ const putPdfFile = async (
     file.name = `${file.name}.pdf`;
   }
 
-  const { type, data } = await putFileServerSide(file);
+  const { type, data } = await putFileServerSide(
+    file,
+    cleanupExternalUploadOnDataFailure
+      ? {
+          onS3KeyAllocated: async (key) => {
+            await reserveInternalSnapshotStorageCleanup({ key });
+          },
+          s3RequestTimeoutMs: INTERNAL_SNAPSHOT_UPLOAD_TIMEOUT_MS,
+        }
+      : undefined,
+  );
 
   let createdData: Awaited<ReturnType<typeof createDocumentData>>;
 
   try {
-    createdData = await createDocumentData({ type, data, initialData });
+    createdData =
+      cleanupExternalUploadOnDataFailure && type === DocumentDataType.S3_PATH
+        ? await createProvisionalInternalDocumentData({ type, data })
+        : await createDocumentData({ type, data, initialData });
   } catch (error) {
     if (cleanupExternalUploadOnDataFailure && type === DocumentDataType.S3_PATH) {
       try {
@@ -111,11 +131,17 @@ export const putNormalizedPdfFileServerSide = async (
 /**
  * Uploads a file to the appropriate storage location.
  */
-export const putFileServerSide = async (file: File) => {
+export const putFileServerSide = async (
+  file: File,
+  options: {
+    onS3KeyAllocated?: (key: string) => Promise<void>;
+    s3RequestTimeoutMs?: number;
+  } = {},
+) => {
   const NEXT_PUBLIC_UPLOAD_TRANSPORT = env('NEXT_PUBLIC_UPLOAD_TRANSPORT');
 
   return await match(NEXT_PUBLIC_UPLOAD_TRANSPORT)
-    .with('s3', async () => putFileInS3(file))
+    .with('s3', async () => putFileInS3(file, options.onS3KeyAllocated, options.s3RequestTimeoutMs))
     .otherwise(async () => putFileInDatabase(file));
 };
 
@@ -132,7 +158,11 @@ const putFileInDatabase = async (file: File) => {
   };
 };
 
-const putFileInS3 = async (file: File) => {
+const putFileInS3 = async (
+  file: File,
+  onS3KeyAllocated?: (key: string) => Promise<void>,
+  requestTimeoutMs?: number,
+) => {
   const buffer = await file.arrayBuffer();
 
   const blob = new Blob([buffer], { type: file.type });
@@ -141,7 +171,10 @@ const putFileInS3 = async (file: File) => {
     type: file.type,
   });
 
-  const { key } = await uploadS3File(newFile);
+  const { key } = await uploadS3File(newFile, {
+    onKeyAllocated: onS3KeyAllocated,
+    requestTimeoutMs,
+  });
 
   return {
     type: DocumentDataType.S3_PATH,

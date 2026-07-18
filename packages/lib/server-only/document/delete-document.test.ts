@@ -18,6 +18,9 @@ const mocks = vi.hoisted(() => ({
   renderEmail: vi.fn(),
   triggerWebhook: vi.fn(),
   loggerError: vi.fn(),
+  lockEnvelopeDocumentDataForCleanup: vi.fn(),
+  stageDocumentDataStorageCleanup: vi.fn(),
+  processDocumentDataStorageCleanupAfterCommit: vi.fn(),
 }));
 
 vi.mock('@documenso/prisma', () => ({
@@ -69,6 +72,17 @@ vi.mock('../../utils/render-email-with-i18n', () => ({
 
 vi.mock('../email/get-email-context', () => ({
   getEmailContext: mocks.getEmailContext,
+}));
+
+vi.mock('../document-data/process-document-data-storage-cleanup', () => ({
+  processDocumentDataStorageCleanupAfterCommit:
+    mocks.processDocumentDataStorageCleanupAfterCommit,
+}));
+
+vi.mock('../document-data/stage-document-data-storage-cleanup', () => ({
+  getDocumentDataPresignReplayNotBefore: () => new Date('2030-01-01T01:05:00.000Z'),
+  lockEnvelopeDocumentDataForCleanup: mocks.lockEnvelopeDocumentDataForCleanup,
+  stageDocumentDataStorageCleanup: mocks.stageDocumentDataStorageCleanup,
 }));
 
 vi.mock('../team/get-member-roles', () => ({
@@ -133,6 +147,9 @@ describe('deleteDocument post-commit effects', () => {
     mocks.mailSend.mockResolvedValue(undefined);
     mocks.auditCreate.mockResolvedValue(undefined);
     mocks.envelopeDelete.mockResolvedValue(envelope);
+    mocks.lockEnvelopeDocumentDataForCleanup.mockResolvedValue(['document-data-1']);
+    mocks.stageDocumentDataStorageCleanup.mockResolvedValue(['cleanup-1']);
+    mocks.processDocumentDataStorageCleanupAfterCommit.mockResolvedValue(undefined);
     mocks.transaction.mockImplementation((callback) =>
       callback({
         documentAuditLog: { create: mocks.auditCreate },
@@ -161,6 +178,22 @@ describe('deleteDocument post-commit effects', () => {
         status: { not: DocumentStatus.COMPLETED },
       },
     });
+    expect(mocks.stageDocumentDataStorageCleanup).toHaveBeenCalledWith({
+      tx: expect.any(Object),
+      documentDataIds: ['document-data-1'],
+      notBefore: new Date('2030-01-01T01:05:00.000Z'),
+    });
+    expect(mocks.processDocumentDataStorageCleanupAfterCommit).toHaveBeenCalledWith({
+      cleanupIds: ['cleanup-1'],
+      envelopeId: envelope.id,
+      event: 'document-cancelled',
+    });
+    expect(mocks.envelopeDelete.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.stageDocumentDataStorageCleanup.mock.invocationCallOrder[0],
+    );
+    expect(mocks.stageDocumentDataStorageCleanup.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.processDocumentDataStorageCleanupAfterCommit.mock.invocationCallOrder[0],
+    );
     expect(mocks.triggerWebhook).toHaveBeenCalledTimes(1);
   });
 
@@ -184,6 +217,7 @@ describe('deleteDocument post-commit effects', () => {
 
     await expect(deleteDocument(options)).rejects.toThrow('database unavailable');
     expect(mocks.triggerWebhook).not.toHaveBeenCalled();
+    expect(mocks.processDocumentDataStorageCleanupAfterCommit).not.toHaveBeenCalled();
   });
 
   it.each([DocumentStatus.COMPLETED, DocumentStatus.REJECTED])(
@@ -249,6 +283,8 @@ describe('deleteDocument post-commit effects', () => {
     });
     expect(mocks.triggerWebhook).not.toHaveBeenCalled();
     expect(mocks.mailSend).not.toHaveBeenCalled();
+    expect(mocks.stageDocumentDataStorageCleanup).not.toHaveBeenCalled();
+    expect(mocks.processDocumentDataStorageCleanupAfterCommit).not.toHaveBeenCalled();
   });
 
   it.each([DocumentStatus.COMPLETED, DocumentStatus.REJECTED])(
@@ -279,6 +315,8 @@ describe('deleteDocument post-commit effects', () => {
       });
       expect(mocks.triggerWebhook).not.toHaveBeenCalled();
       expect(mocks.mailSend).not.toHaveBeenCalled();
+      expect(mocks.stageDocumentDataStorageCleanup).not.toHaveBeenCalled();
+      expect(mocks.processDocumentDataStorageCleanupAfterCommit).not.toHaveBeenCalled();
     },
   );
 });

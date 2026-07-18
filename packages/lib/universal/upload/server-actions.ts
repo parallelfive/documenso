@@ -104,7 +104,13 @@ export const getPresignGetUrl = async (key: string) => {
 /**
  * Uploads a file to S3.
  */
-export const uploadS3File = async (file: File) => {
+export const uploadS3File = async (
+  file: File,
+  options: {
+    onKeyAllocated?: (key: string) => Promise<void>;
+    requestTimeoutMs?: number;
+  } = {},
+) => {
   const client = getS3Client();
 
   // Get the basename and extension for the file
@@ -112,29 +118,73 @@ export const uploadS3File = async (file: File) => {
 
   const key = `${alphaid(12)}/${slugify(name)}${ext}`;
 
+  await options.onKeyAllocated?.(key);
+
+  const uploadStartedAt = Date.now();
   const fileBuffer = await file.arrayBuffer();
+  const remainingTimeoutMs = options.requestTimeoutMs
+    ? options.requestTimeoutMs - (Date.now() - uploadStartedAt)
+    : undefined;
 
-  const response = await client.send(
-    new PutObjectCommand({
-      Bucket: env('NEXT_PRIVATE_UPLOAD_BUCKET'),
-      Key: key,
-      Body: Buffer.from(fileBuffer),
-      ContentType: file.type,
-    }),
-  );
+  if (remainingTimeoutMs !== undefined && remainingTimeoutMs <= 0) {
+    throw new Error('S3 upload exceeded its request deadline');
+  }
 
-  return { key, response };
+  const abortController = remainingTimeoutMs !== undefined ? new AbortController() : undefined;
+  const timeout = abortController
+    ? setTimeout(() => abortController.abort(), remainingTimeoutMs)
+    : undefined;
+  const putObjectCommand = new PutObjectCommand({
+    Bucket: env('NEXT_PRIVATE_UPLOAD_BUCKET'),
+    Key: key,
+    Body: Buffer.from(fileBuffer),
+    ContentType: file.type,
+  });
+
+  try {
+    const response = abortController
+      ? await client.send(putObjectCommand, {
+          abortSignal: abortController.signal,
+        })
+      : await client.send(putObjectCommand);
+
+    return { key, response };
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 };
 
-export const deleteS3File = async (key: string) => {
+export const deleteS3File = async (
+  key: string,
+  options: {
+    requestTimeoutMs?: number;
+  } = {},
+) => {
   const client = getS3Client();
+  const abortController = options.requestTimeoutMs ? new AbortController() : undefined;
+  const timeout = abortController
+    ? setTimeout(() => abortController.abort(), options.requestTimeoutMs)
+    : undefined;
+  const deleteObjectCommand = new DeleteObjectCommand({
+    Bucket: env('NEXT_PRIVATE_UPLOAD_BUCKET'),
+    Key: key,
+  });
 
-  await client.send(
-    new DeleteObjectCommand({
-      Bucket: env('NEXT_PRIVATE_UPLOAD_BUCKET'),
-      Key: key,
-    }),
-  );
+  try {
+    if (abortController) {
+      await client.send(deleteObjectCommand, {
+        abortSignal: abortController.signal,
+      });
+    } else {
+      await client.send(deleteObjectCommand);
+    }
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 };
 
 const getS3Client = () => {

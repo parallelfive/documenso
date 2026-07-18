@@ -7,6 +7,7 @@ import type {
   Recipient,
 } from '@prisma/client';
 import {
+  DocumentDataType,
   DocumentSigningOrder,
   DocumentStatus,
   EnvelopeType,
@@ -50,7 +51,6 @@ import {
   ZTextFieldMeta,
 } from '../../types/field-meta';
 import { mapEnvelopeToWebhookDocumentPayload } from '../../types/webhook-payload';
-import { deleteFile } from '../../universal/upload/delete-file';
 import {
   FileSizeLimitExceededError,
   getFileServerSide,
@@ -68,6 +68,12 @@ import {
   getRecipientsWithMissingFields,
   isRecipientEmailValidForSending,
 } from '../../utils/recipients';
+import { processDocumentDataStorageCleanupAfterCommit } from '../document-data/process-document-data-storage-cleanup';
+import {
+  getDocumentDataPresignReplayNotBefore,
+  releaseProvisionalDocumentDataStorageCleanup,
+  stageDocumentDataStorageCleanup,
+} from '../document-data/stage-document-data-storage-cleanup';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
 import { insertFormValuesInPdf } from '../pdf/insert-form-values-in-pdf';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
@@ -219,6 +225,7 @@ export const sendDocument = async ({
   }
 
   let preparedExecutionPdfSnapshot: PreparedExecutionPdfSnapshot | null = null;
+  let sourceStorageCleanupIds: string[] = [];
 
   if (isBizBuddyExternalId(envelope.externalId)) {
     if (!expectedExecution) {
@@ -368,39 +375,38 @@ export const sendDocument = async ({
         message: 'Document PDF changed before dispatch',
       });
     }
+
+    if (preparedExecutionPdfSnapshot.documentData.type === DocumentDataType.S3_PATH) {
+      await releaseProvisionalDocumentDataStorageCleanup({
+        tx,
+        documentDataId: preparedExecutionPdfSnapshot.documentData.id,
+      });
+    }
+
+    sourceStorageCleanupIds = await stageDocumentDataStorageCleanup({
+      tx,
+      documentDataIds: [preparedExecutionPdfSnapshot.sourceDocumentDataId],
+      notBefore: getDocumentDataPresignReplayNotBefore(),
+    });
   };
 
   const cleanUpPreparedExecutionPdfSnapshot = async () => {
     if (!preparedExecutionPdfSnapshot) return;
 
     try {
-      const unreferencedSnapshot = await prisma.documentData.findFirst({
-        where: {
-          id: preparedExecutionPdfSnapshot.documentData.id,
-          envelopeItem: null,
-        },
-        select: {
-          id: true,
-        },
+      const cleanupIds = await prisma.$transaction(async (tx) =>
+        stageDocumentDataStorageCleanup({
+          tx,
+          documentDataIds: [preparedExecutionPdfSnapshot.documentData.id],
+          preserveExistingNotBefore: false,
+        }),
+      );
+
+      await processDocumentDataStorageCleanupAfterCommit({
+        cleanupIds,
+        envelopeId: envelope.id,
+        event: 'document-snapshot-abandoned',
       });
-
-      if (!unreferencedSnapshot) return;
-
-      await deleteFile(preparedExecutionPdfSnapshot.documentData);
-
-      const deleted = await prisma.documentData.deleteMany({
-        where: {
-          id: preparedExecutionPdfSnapshot.documentData.id,
-          envelopeItem: null,
-        },
-      });
-
-      if (deleted.count !== 1) {
-        logger.error({
-          message: 'Execution PDF snapshot cleanup lost its unreferenced-row guard',
-          documentDataId: preparedExecutionPdfSnapshot.documentData.id,
-        });
-      }
     } catch (error) {
       // Cleanup is best-effort and must never replace the dispatch error.
       logger.warn({
@@ -481,6 +487,12 @@ export const sendDocument = async ({
         throw error;
       }
     }
+
+    await processDocumentDataStorageCleanupAfterCommit({
+      cleanupIds: sourceStorageCleanupIds,
+      envelopeId: envelope.id,
+      event: 'document-source-retired',
+    });
 
     await jobs.triggerJob({
       name: 'internal.seal-document',
@@ -672,6 +684,12 @@ export const sendDocument = async ({
       await cleanUpPreparedExecutionPdfSnapshot();
       throw error;
     });
+
+  await processDocumentDataStorageCleanupAfterCommit({
+    cleanupIds: sourceStorageCleanupIds,
+    envelopeId: envelope.id,
+    event: 'document-source-retired',
+  });
 
   const isRecipientSigningRequestEmailEnabled = extractDerivedDocumentEmailSettings(
     updatedEnvelope.documentMeta,

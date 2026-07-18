@@ -21,15 +21,15 @@ const mocks = vi.hoisted(() => ({
   envelopeFindUnique: vi.fn(),
   envelopeFindFirstOrThrow: vi.fn(),
   envelopeItemUpdateMany: vi.fn(),
-  documentDataFindFirst: vi.fn(),
-  documentDataDeleteMany: vi.fn(),
   auditCreate: vi.fn(),
   fieldUpdate: vi.fn(),
   recipientUpdateMany: vi.fn(),
   getEnvelopeWhereInput: vi.fn(),
   getFileServerSide: vi.fn(),
   putInternalPdfSnapshotServerSide: vi.fn(),
-  deleteFile: vi.fn(),
+  stageDocumentDataStorageCleanup: vi.fn(),
+  releaseProvisionalDocumentDataStorageCleanup: vi.fn(),
+  processDocumentDataStorageCleanupAfterCommit: vi.fn(),
   jobsTrigger: vi.fn(),
   triggerWebhook: vi.fn(),
 }));
@@ -38,10 +38,6 @@ vi.mock('@documenso/prisma', () => ({
   prisma: {
     envelope: {
       findFirst: mocks.envelopeFindFirst,
-    },
-    documentData: {
-      findFirst: mocks.documentDataFindFirst,
-      deleteMany: mocks.documentDataDeleteMany,
     },
     $transaction: mocks.transaction,
   },
@@ -55,10 +51,6 @@ vi.mock('../../universal/upload/get-file.server', async (importOriginal) => ({
 vi.mock('../../universal/upload/put-file.server', () => ({
   putInternalPdfSnapshotServerSide: mocks.putInternalPdfSnapshotServerSide,
   putNormalizedPdfFileServerSide: vi.fn(),
-}));
-
-vi.mock('../../universal/upload/delete-file', () => ({
-  deleteFile: mocks.deleteFile,
 }));
 
 vi.mock('../../jobs/client', () => ({
@@ -85,6 +77,18 @@ vi.mock('../../utils/recipients', () => ({
 
 vi.mock('../envelope/get-envelope-by-id', () => ({
   getEnvelopeWhereInput: mocks.getEnvelopeWhereInput,
+}));
+
+vi.mock('../document-data/process-document-data-storage-cleanup', () => ({
+  processDocumentDataStorageCleanupAfterCommit:
+    mocks.processDocumentDataStorageCleanupAfterCommit,
+}));
+
+vi.mock('../document-data/stage-document-data-storage-cleanup', () => ({
+  getDocumentDataPresignReplayNotBefore: () => new Date('2030-01-01T01:05:00.000Z'),
+  releaseProvisionalDocumentDataStorageCleanup:
+    mocks.releaseProvisionalDocumentDataStorageCleanup,
+  stageDocumentDataStorageCleanup: mocks.stageDocumentDataStorageCleanup,
 }));
 
 vi.mock('../webhooks/trigger/trigger-webhook', () => ({
@@ -237,8 +241,16 @@ describe('sendDocument immutable atomic execution lease', () => {
         return await Promise.resolve({ count: 1 });
       },
     );
-    mocks.documentDataFindFirst.mockResolvedValue({ id: snapshotDocumentData.id });
-    mocks.documentDataDeleteMany.mockResolvedValue({ count: 1 });
+    mocks.stageDocumentDataStorageCleanup.mockImplementation(
+      async ({ documentDataIds }: { documentDataIds: string[] }) =>
+        await Promise.resolve(
+          documentDataIds.includes(sourceDocumentData.id)
+            ? ['cleanup-source']
+            : ['cleanup-snapshot'],
+        ),
+    );
+    mocks.processDocumentDataStorageCleanupAfterCommit.mockResolvedValue(undefined);
+    mocks.releaseProvisionalDocumentDataStorageCleanup.mockResolvedValue(undefined);
     mocks.transaction.mockImplementation((callback) =>
       callback({
         envelope: {
@@ -313,16 +325,16 @@ describe('sendDocument immutable atomic execution lease', () => {
       },
     });
     expect(mocks.envelopeItemUpdateMany).not.toHaveBeenCalled();
-    expect(mocks.documentDataDeleteMany).toHaveBeenCalledWith({
-      where: {
-        id: snapshotDocumentData.id,
-        envelopeItem: null,
-      },
+    expect(mocks.stageDocumentDataStorageCleanup).toHaveBeenCalledWith({
+      tx: expect.any(Object),
+      documentDataIds: [snapshotDocumentData.id],
+      preserveExistingNotBefore: false,
     });
-    expect(mocks.deleteFile).toHaveBeenCalledWith(snapshotDocumentData);
-    expect(mocks.deleteFile.mock.invocationCallOrder[0]).toBeLessThan(
-      mocks.documentDataDeleteMany.mock.invocationCallOrder[0],
-    );
+    expect(mocks.processDocumentDataStorageCleanupAfterCommit).toHaveBeenCalledWith({
+      cleanupIds: ['cleanup-snapshot'],
+      envelopeId: envelope.id,
+      event: 'document-snapshot-abandoned',
+    });
     expect(mocks.auditCreate).not.toHaveBeenCalled();
     expect(mocks.jobsTrigger).not.toHaveBeenCalled();
     expect(mocks.triggerWebhook).not.toHaveBeenCalled();
@@ -360,18 +372,35 @@ describe('sendDocument immutable atomic execution lease', () => {
       },
     });
     expect(attachedDocumentDataId).toBe(snapshotDocumentData.id);
+    expect(mocks.stageDocumentDataStorageCleanup).toHaveBeenCalledWith({
+      tx: expect.any(Object),
+      documentDataIds: [sourceDocumentData.id],
+      notBefore: new Date('2030-01-01T01:05:00.000Z'),
+    });
+    expect(mocks.releaseProvisionalDocumentDataStorageCleanup).toHaveBeenCalledWith({
+      tx: expect.any(Object),
+      documentDataId: snapshotDocumentData.id,
+    });
+    expect(
+      mocks.releaseProvisionalDocumentDataStorageCleanup.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.stageDocumentDataStorageCleanup.mock.invocationCallOrder[0]);
+    expect(mocks.processDocumentDataStorageCleanupAfterCommit).toHaveBeenCalledWith({
+      cleanupIds: ['cleanup-source'],
+      envelopeId: envelope.id,
+      event: 'document-source-retired',
+    });
 
     // A retained client presign can still overwrite only the now-orphaned
-    // original key; the bytes captured by the attached snapshot do not change.
+    // original key; the retained cleanup task performs a mandatory final
+    // DeleteObject after that presign expires.
     replayableOriginalObject.fill(0);
     expect(capturedSnapshotBytes).toEqual(sourcePdf);
-    expect(mocks.documentDataDeleteMany).not.toHaveBeenCalled();
     expect(mocks.triggerWebhook).toHaveBeenCalledTimes(1);
   });
 
   it('never deletes snapshot bytes when cleanup observes an attached reference', async () => {
     mocks.envelopeUpdateMany.mockResolvedValue({ count: 0 });
-    mocks.documentDataFindFirst.mockResolvedValue(null);
+    mocks.stageDocumentDataStorageCleanup.mockResolvedValueOnce([]);
 
     await expect(
       sendDocument({
@@ -387,9 +416,38 @@ describe('sendDocument immutable atomic execution lease', () => {
       code: AppErrorCode.CONFLICT,
     });
 
-    expect(mocks.documentDataFindFirst).toHaveBeenCalledTimes(1);
-    expect(mocks.documentDataDeleteMany).not.toHaveBeenCalled();
-    expect(mocks.deleteFile).not.toHaveBeenCalled();
+    expect(mocks.processDocumentDataStorageCleanupAfterCommit).toHaveBeenCalledWith({
+      cleanupIds: [],
+      envelopeId: envelope.id,
+      event: 'document-snapshot-abandoned',
+    });
+  });
+
+  it('rolls back attachment when the provisional cleanup intent is missing', async () => {
+    mocks.releaseProvisionalDocumentDataStorageCleanup.mockRejectedValueOnce(
+      new Error('Internal snapshot cleanup reservation was not released'),
+    );
+
+    await expect(
+      sendDocument({
+        id: { type: 'envelopeId', id: envelope.id },
+        userId: 7,
+        teamId: envelope.teamId,
+        sendEmail: false,
+        expectedExecution,
+        requireDraftStatus: true,
+        requestMetadata,
+      }),
+    ).rejects.toThrow('Internal snapshot cleanup reservation was not released');
+
+    expect(mocks.envelopeItemUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.stageDocumentDataStorageCleanup).toHaveBeenCalledWith({
+      tx: expect.any(Object),
+      documentDataIds: [snapshotDocumentData.id],
+      preserveExistingNotBefore: false,
+    });
+    expect(mocks.jobsTrigger).not.toHaveBeenCalled();
+    expect(mocks.triggerWebhook).not.toHaveBeenCalled();
   });
 
   it('attaches the snapshot before enqueueing the no-action seal branch', async () => {
@@ -438,6 +496,9 @@ describe('sendDocument immutable atomic execution lease', () => {
       }),
     );
     expect(mocks.envelopeItemUpdateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.jobsTrigger.mock.invocationCallOrder[0],
+    );
+    expect(mocks.processDocumentDataStorageCleanupAfterCommit.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.jobsTrigger.mock.invocationCallOrder[0],
     );
   });

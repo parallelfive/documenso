@@ -344,15 +344,13 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
   immediate no-action seal branch commit the swap before email/webhook/job
   enqueue. Replaying the original one-hour presigned PUT can therefore alter
   only the orphaned upload key, never the bytes later sealed or signed.
-- **Snapshot failure cleanup:** a losing/replayed send cleans only its own fresh
-  snapshot. Cleanup first proves the `DocumentData` has zero envelope-item
-  references, deletes the external object, then deletes the still-unreferenced
-  row with the same guard. A referenced row is never deleted, and cleanup
-  failure is bounded operational evidence that never replaces the original
-  dispatch error. The snapshot-specific upload path also best-effort deletes
-  its just-created S3 object if the subsequent `DocumentData` insert fails,
-  without changing generic/native upload behavior or masking the database
-  error.
+- **Snapshot failure cleanup:** the snapshot-specific upload path reserves a
+  durable cleanup intent before `PutObject`, binds it atomically to the fresh
+  `DocumentData`, and releases exactly one bound intent in the successful item
+  swap transaction. A losing/replayed send converts its unreferenced snapshot
+  to the same durable cleanup path described in patch 8. Process death at any
+  point from key allocation through attachment therefore leaves either no
+  object or a recoverable intent. Generic/native upload behavior is unchanged.
 - **Atomic claim:** send changes `DRAFT` to `PENDING` with an exact-team,
   document-type, exact-external-ID, draft-only predicate. In the same database
   transaction it rereads the current external ID, team, signing order,
@@ -439,9 +437,9 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
     mutation services and correlated creation-profile guards plus native
     envelope/embedding routes — creation-time execution/content freeze and
     one-time population boundary.
-  - `packages/lib/universal/upload/put-file.server.ts` — fresh server-credential
-    snapshot upload using an undisclosed random key plus snapshot-only
-    post-upload row-failure orphan cleanup.
+  - `packages/lib/universal/upload/{server-actions,put-file.server}.ts` — fresh
+    server-credential snapshot upload using an undisclosed random key plus the
+    pre-Put durable reservation and atomic metadata binding from patch 8.
   - `packages/lib/server-only/document/{delete-document,resend-document,complete-document-with-token}.ts`
     — automatic correlated cancellation/reminder strictness and the historical
     next-signer identity-mutation sink boundary.
@@ -476,6 +474,74 @@ The actual upstream sync happens via targeted rebase per file. See `~/parallel5/
 - **Remove when:** upstream exposes an equivalent body-less `PutObject`
   presigning policy, or the AWS SDK no longer derives optional payload
   checksums from an absent body.
+
+### 8. Durable document-data and object retirement — landed 2026-07-18
+
+- **Why:** deleting a draft or pending envelope cascaded `EnvelopeItem` rows
+  but left their `DocumentData` rows and S3 objects. Correlated atomic send also
+  replaced the client-upload source with an immutable snapshot without
+  retiring the now-unreferenced source. A successful API cancellation could
+  therefore return 404 for the envelope while retaining both source and
+  snapshot PDFs.
+- **Transactional retirement:** hard delete locks the envelope and its current
+  items, repeats the legal-state delete predicate, then in the same transaction
+  stages every unique S3 key, deletes every now-unreferenced `DocumentData`
+  row, and commits the cancellation. Atomic send stages the detached source in
+  the snapshot-attach transaction. Database-backed `BYTES`/`BYTES_64` content
+  is deleted with its row and is never copied into the key-only outbox.
+- **Crash-safe internal snapshots:** the internal-only upload allocates its
+  random key, durably reserves a non-early cleanup intent, and only then starts
+  `PutObject`. Snapshot metadata creation atomically binds that intent.
+  Successful attachment must release exactly one bound intent in the item-swap
+  transaction or the swap rolls back. A process death before upload, after
+  upload, after metadata creation, or before attach is therefore recoverable;
+  the sweeper retires only a still-unattached provisional row. The internal
+  upload has a five-minute end-to-end post-reservation deadline, safely inside
+  the 15-minute attach grace; a hung upload aborts while its intent remains.
+  Generic/native server uploads retain their existing request behavior.
+- **Replay-safe deletion:** client upload presigns remain valid for one hour.
+  Source/cancellation tasks perform an immediate idempotent `DeleteObject` but
+  retain their intent for 65 minutes, then perform a mandatory final delete.
+  A replay after the early delete cannot resurrect retained bytes. Concurrent
+  extensions use guarded predicates and can never shorten or lose the later
+  final-delete obligation.
+- **Reference and race safety:** every physical delete rechecks both
+  `DocumentData.data` and `initialData`. Shared keys are deferred, attached
+  provisional snapshots cancel stale intents, item/status transitions are
+  row-locked, and outbox acknowledgement repeats the selected `notBefore`
+  predicate. DeleteObject is idempotent, so worker/acknowledgement races safely
+  repeat. No key or PDF content is emitted to logs.
+- **Durable retry:** cleanup runs synchronously after commit for prompt
+  retirement but never turns a committed send/cancellation into a false
+  rollback. Failed tasks retain attempt metadata and a bounded,
+  four-concurrent, 100-task cron sweep retries every 15 minutes. Each cleanup
+  `DeleteObject` has a 15-second deadline; a timeout retains the task instead of
+  hanging a committed API response or worker slot. The release migration, run
+  while the provider is quiesced, backfills unique existing orphan S3 keys with
+  the same replay window, skips keys still referenced by either column, and
+  removes orphan database content.
+- **Files:**
+  - `packages/prisma/schema.prisma` and
+    `20260718010000_add_document_data_storage_cleanup` — durable key-only
+    outbox plus conservative orphan backfill.
+  - `packages/lib/server-only/document-data/{stage,process}-document-data-storage-cleanup.ts`
+    — transactional staging/locking, provisional reservation/binding/release,
+    reference-safe DeleteObject, and guarded acknowledgement.
+  - `packages/lib/server-only/document/{send-document,delete-document}.ts` —
+    source retirement and native/API hard-delete integration.
+  - `packages/lib/universal/upload/{server-actions,put-file.server}.ts` —
+    pre-Put key reservation hook and internal snapshot binding.
+  - `packages/lib/jobs/definitions/internal/cleanup-document-data-storage*` —
+    bounded durable retry sweep.
+  - Focused unit tests plus the opt-in PostgreSQL/real AWS SDK loopback test
+    cover migration backfill, no payload copying, source/snapshot success,
+    pre-Put and post-bind process death, replay after early delete, final
+    delete, shared `data`/`initialData`, missing intent rollback, storage
+    failure, and concurrent cutoff/acknowledgement races.
+- **Remove when:** upstream transactionally retires unreferenced document data
+  and every backing object across native/API lifecycle paths with equivalent
+  crash recovery, presign-replay protection, reference guards, bounded durable
+  retry, and secret-safe observability.
 
 ## Planned Patches
 

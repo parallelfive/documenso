@@ -502,6 +502,21 @@ model DocumentData {
   envelopeItem EnvelopeItem?
 }
 
+model DocumentDataStorageCleanup {
+  id                     String    @id @default(cuid())
+  key                    String    @unique
+  documentDataId         String?
+  notBefore              DateTime  @default(now())
+  earlyDeleteEnabled     Boolean   @default(true)
+  earlyDeleteAttemptedAt DateTime?
+  attemptCount           Int       @default(0)
+  lastAttemptAt          DateTime?
+  createdAt              DateTime  @default(now())
+
+  @@index([notBefore, createdAt])
+  @@index([documentDataId])
+}
+
 enum DocumentDistributionMethod {
   EMAIL
   NONE

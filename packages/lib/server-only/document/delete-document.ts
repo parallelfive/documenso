@@ -21,6 +21,12 @@ import { type EnvelopeIdOptions, unsafeBuildEnvelopeIdQuery } from '../../utils/
 import { logger } from '../../utils/logger';
 import { isRecipientEmailValidForSending } from '../../utils/recipients';
 import { renderEmailWithI18N } from '../../utils/render-email-with-i18n';
+import { processDocumentDataStorageCleanupAfterCommit } from '../document-data/process-document-data-storage-cleanup';
+import {
+  getDocumentDataPresignReplayNotBefore,
+  lockEnvelopeDocumentDataForCleanup,
+  stageDocumentDataStorageCleanup,
+} from '../document-data/stage-document-data-storage-cleanup';
 import { getEmailContext } from '../email/get-email-context';
 import { getMemberRoles } from '../team/get-member-roles';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
@@ -198,9 +204,15 @@ const handleDocumentOwnerDelete = async ({
 
   // Hard delete draft and pending documents.
   let deletedEnvelope: Envelope;
+  let storageCleanupIds: string[] = [];
 
   try {
     deletedEnvelope = await prisma.$transaction(async (tx) => {
+      const documentDataIds = await lockEnvelopeDocumentDataForCleanup({
+        tx,
+        envelopeId: envelope.id,
+      });
+
       // Currently redundant since deleting a document will delete the audit logs.
       // However may be useful if we disassociate audit logs and documents if required.
       await tx.documentAuditLog.create({
@@ -214,7 +226,7 @@ const handleDocumentOwnerDelete = async ({
         }),
       });
 
-      return await tx.envelope.delete({
+      const result = await tx.envelope.delete({
         where: {
           id: envelope.id,
           status: requireCancellableStatus
@@ -226,6 +238,14 @@ const handleDocumentOwnerDelete = async ({
               },
         },
       });
+
+      storageCleanupIds = await stageDocumentDataStorageCleanup({
+        tx,
+        documentDataIds,
+        notBefore: getDocumentDataPresignReplayNotBefore(),
+      });
+
+      return result;
     });
   } catch (error) {
     if (
@@ -242,6 +262,12 @@ const handleDocumentOwnerDelete = async ({
 
     throw error;
   }
+
+  await processDocumentDataStorageCleanupAfterCommit({
+    cleanupIds: storageCleanupIds,
+    envelopeId: envelope.id,
+    event: 'document-cancelled',
+  });
 
   const isEnvelopeDeleteEmailEnabled = extractDerivedDocumentEmailSettings(
     envelope.documentMeta,
