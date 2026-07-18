@@ -8,8 +8,8 @@
 #
 # This file is a thin wrapper around upstream's docker/Dockerfile so that
 # any upstream changes to the build pipeline flow through automatically
-# on rebase. Patches live in the source tree itself (apps/, packages/),
-# not as overlays.
+# on rebase. Patches live in the source tree itself (apps/, packages/,
+# docker/), not as overlays.
 #
 # Build:    ghcr.io/parallelfive/documenso:latest
 # Built by: .github/workflows/build-p5-image.yml on push to p5/patched +
